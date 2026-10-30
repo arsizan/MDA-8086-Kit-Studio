@@ -11,7 +11,7 @@ mkdir -p build/obj
 for f in $(cat jwasm/SOURCES.txt); do
   $CC -O2 -w -D__NT__ -DNDEBUG $DEFS -Dexit=jw_exit -Ijwasm/H -c jwasm/$f.c -o build/obj/jw_$f.o
 done
-for f in kitasm kitcore kitport_win main; do
+for f in kitasm kitcore kitport_win kitsim kithint main; do
   $CC -O2 -Wall -Wextra -Wno-unused-parameter -Wno-cast-function-type $DEFS -c src/$f.c -o build/obj/$f.o
 done
 $WINDRES -i res/app.rc -o build/obj/app_res.o

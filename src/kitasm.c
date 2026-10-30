@@ -82,8 +82,10 @@ int kit_exe_to_code(const unsigned char *d, long n, unsigned char **code, int *l
     org = start + KIT_ORG;
     for (i = start; i < org && i < size; i++) {
         if (d[i] != 0) {
-            snprintf(why, whysize, "Code or data found below 1000H. Put CODE SEGMENT first "
-                     "and ORG 1000H before the first instruction.");
+            snprintf(why, whysize, "The program does not start at 1000H (code or data was placed "
+                     "below 1000H). Kit programs start at 0000:1000: put ORG 1000H right after .CODE "
+                     "(or after CODE SEGMENT / ASSUME), before the first instruction. "
+                     "A DATA SEGMENT ... ENDS block must come after the code.");
             return -1;
         }
     }

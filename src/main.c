@@ -20,12 +20,18 @@
 #include <string.h>
 #include "kitasm.h"
 #include "kitcore.h"
-#include "examples.h"
+#include "kitsim.h"
+#include "kithint.h"
 #include "resource.h"
 
 #define APP_NAME    "MDA-8086 Kit Studio"
+#define APP_VERSION "1.1"
 #define WM_KITTEXT  (WM_APP + 1)     /* wParam = kind, lParam = malloc'd text */
 #define WM_KITSTATE (WM_APP + 2)     /* wParam = busy, lParam = malloc'd port name or NULL */
+#define MAX_EXAMPLES 100
+#define KO_DUMP      9               /* output kinds used only here (see kind_color) */
+#define KO_HINT      10
+#define KO_CHECK     11
 
 enum {
     IDC_EDIT = 100, IDC_OUT, IDC_CMD, IDC_STATUS, IDC_PORT,
@@ -33,8 +39,9 @@ enum {
     IDM_NEW = 200, IDM_OPEN, IDM_SAVE, IDM_SAVEAS, IDM_EXIT,
     IDM_UNDO, IDM_CUT, IDM_COPY, IDM_PASTE, IDM_SELALL,
     IDM_ASM, IDM_RUN, IDM_SENDABS, IDM_STOP, IDM_FIND, IDM_CLEAR, IDM_SHOWCODE,
-    IDM_EX_K28, IDM_EX_K27A, IDM_EX_K27, IDM_EX_SIZAN, IDM_EX_JOY, IDM_EX_TEMPLATE,
-    IDM_HELP, IDM_HELP_CONN, IDM_ABOUT
+    IDM_HELP, IDM_HELP_CONN, IDM_ABOUT,
+    IDM_EX_NONE = 299,
+    IDM_EX_FIRST = 300              /* 300 .. 300+MAX_EXAMPLES-1: files in the examples folder */
 };
 
 enum { JOB_NONE, JOB_RUN, JOB_CMD, JOB_FIND, JOB_PORT };
@@ -47,7 +54,12 @@ static HFONT g_fontMono, g_fontUI;
 static HACCEL g_accel;
 static int g_dpi = 96;
 static char g_path[MAX_PATH];          /* current file, "" = not saved yet */
+static char g_shownName[MAX_PATH];     /* name shown for an unsaved copy of an example */
 static char g_tmpdir[MAX_PATH];
+static char g_exDir[MAX_PATH];         /* "<folder of KitStudio.exe>\examples\" */
+static char g_exNames[MAX_EXAMPLES][MAX_PATH];
+static int g_exCount;
+static HMENU g_exMenu;
 static int g_outAtLineStart = 1;
 static int g_lastLine = -1, g_lastCol = -1;
 static char *g_lastCode;               /* machine code of the last assembly */
@@ -74,7 +86,9 @@ static COLORREF kind_color(int kind)
     case KO_WARN: return RGB(185, 100, 0);
     case KO_ERR:  return RGB(205, 0, 0);
     case KO_KIT:  return RGB(0, 70, 165);
-    case 9:       return RGB(110, 110, 110);   /* machine code dump */
+    case KO_DUMP: return RGB(110, 110, 110);   /* machine code dump */
+    case KO_HINT: return RGB(120, 50, 160);    /* hints for assembler errors */
+    case KO_CHECK: return RGB(0, 105, 120);    /* kit check (model of the kit) */
     default:      return RGB(40, 40, 40);
     }
 }
@@ -133,6 +147,24 @@ static void outf(int kind, const char *fmt, ...)
     buf[sizeof buf - 1] = 0;
     va_end(ap);
     out_msg(kind, buf);
+}
+
+/* several lines; a line that starts with '!' is a warning */
+static void out_lines(int kind, const char *text)
+{
+    const char *p = text;
+    while (*p) {
+        const char *e = strchr(p, '\n');
+        int n = e ? (int)(e - p) : (int)strlen(p);
+        char line[1024];
+        if (n > (int)sizeof line - 1) n = (int)sizeof line - 1;
+        memcpy(line, p, n);
+        line[n] = 0;
+        if (line[0] == '!') outf(KO_WARN, "! %s", line + 1);
+        else if (line[0]) out_msg(kind, line);
+        if (!e) break;
+        p = e + 1;
+    }
 }
 
 /* called from the worker thread */
@@ -278,23 +310,38 @@ static const char *file_part(const char *path)
     return a ? a + 1 : path;
 }
 
+/* name used in the title bar and in assembler messages */
+static const char *shown_name(void)
+{
+    if (g_path[0]) return file_part(g_path);
+    if (g_shownName[0]) return g_shownName;
+    return "Untitled";
+}
+
 static void update_title(void)
 {
     char t[MAX_PATH + 64];
     int mod = (int)SendMessageA(g_edit, EM_GETMODIFY, 0, 0);
-    snprintf(t, sizeof t, "%s%s - %s", g_path[0] ? file_part(g_path) : "Untitled",
-             mod ? "*" : "", APP_NAME);
+    snprintf(t, sizeof t, "%s%s - %s", shown_name(), mod ? "*" : "", APP_NAME);
     SetWindowTextA(g_main, t);
-    snprintf(g_sbFile, sizeof g_sbFile, "%s%s", g_path[0] ? g_path : "Untitled (not saved yet)", mod ? "  (changed)" : "");
+    if (g_path[0])
+        snprintf(g_sbFile, sizeof g_sbFile, "%s%s", g_path, mod ? "  (changed)" : "");
+    else if (g_shownName[0])
+        snprintf(g_sbFile, sizeof g_sbFile, "%s (copy of an example, not saved yet)%s", g_shownName,
+                 mod ? "  (changed)" : "");
+    else
+        snprintf(g_sbFile, sizeof g_sbFile, "Untitled (not saved yet)%s", mod ? "  (changed)" : "");
     SendMessageA(g_status, SB_SETTEXTA, 1, (LPARAM)g_sbFile);
 }
 
-static void set_editor_text(const char *text, const char *path)
+/* path = file on disk (or NULL); name = name to show for an unsaved copy (or NULL) */
+static void set_editor_text(const char *text, const char *path, const char *name)
 {
     SetWindowTextA(g_edit, text);
     SendMessageA(g_edit, EM_SETMODIFY, FALSE, 0);
     SendMessageA(g_edit, EM_EMPTYUNDOBUFFER, 0, 0);
     snprintf(g_path, sizeof g_path, "%s", path ? path : "");
+    snprintf(g_shownName, sizeof g_shownName, "%s", (!path && name) ? name : "");
     update_title();
 }
 
@@ -310,6 +357,7 @@ static int save_to(const char *path)
         return 0;
     }
     snprintf(g_path, sizeof g_path, "%s", path);
+    g_shownName[0] = 0;
     SendMessageA(g_edit, EM_SETMODIFY, FALSE, 0);
     update_title();
     return 1;
@@ -319,7 +367,8 @@ static int save_as(void)
 {
     OPENFILENAMEA ofn;
     char file[MAX_PATH];
-    snprintf(file, sizeof file, "%s", g_path[0] ? file_part(g_path) : "PROGRAM.ASM");
+    snprintf(file, sizeof file, "%s", g_path[0] ? file_part(g_path) :
+             (g_shownName[0] ? g_shownName : "PROGRAM.ASM"));
     memset(&ofn, 0, sizeof ofn);
     ofn.lStructSize = sizeof ofn;
     ofn.hwndOwner = g_main;
@@ -359,7 +408,7 @@ static void open_path(const char *path)
         MessageBoxA(g_main, msg, APP_NAME, MB_ICONERROR);
         return;
     }
-    set_editor_text(text, path);
+    set_editor_text(text, path, NULL);
     free(text);
     outf(KO_INFO, "Opened %s", path);
 }
@@ -379,11 +428,66 @@ static void do_open(void)
     if (GetOpenFileNameA(&ofn)) open_path(file);
 }
 
-static void load_example(const char *text, const char *name)
+/* ------------------------------------------------------------------ examples folder */
+static int cmp_names(const void *a, const void *b)
 {
+    return _stricmp((const char *)a, (const char *)b);
+}
+
+/* the Examples menu lists the .ASM files in the "examples" folder next to KitStudio.exe;
+   it is filled again every time the menu opens, so new files show up at once */
+static void fill_examples_menu(void)
+{
+    WIN32_FIND_DATAA fd;
+    HANDLE h;
+    char pattern[MAX_PATH + 8];
+    int i;
+    while (GetMenuItemCount(g_exMenu) > 0) DeleteMenu(g_exMenu, 0, MF_BYPOSITION);
+    g_exCount = 0;
+    snprintf(pattern, sizeof pattern, "%s*.asm", g_exDir);
+    h = FindFirstFileA(pattern, &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && g_exCount < MAX_EXAMPLES)
+                snprintf(g_exNames[g_exCount++], MAX_PATH, "%s", fd.cFileName);
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+    qsort(g_exNames, g_exCount, MAX_PATH, cmp_names);
+    for (i = 0; i < g_exCount; i++) {
+        char item[MAX_PATH + 8];
+        int k = 0;
+        const char *p;
+        for (p = g_exNames[i]; *p && k < MAX_PATH; p++) {   /* '&' would underline the next letter */
+            if (*p == '&') item[k++] = '&';
+            item[k++] = *p;
+        }
+        item[k] = 0;
+        AppendMenuA(g_exMenu, MF_STRING, IDM_EX_FIRST + i, item);
+    }
+    if (g_exCount == 0)
+        AppendMenuA(g_exMenu, MF_STRING | MF_GRAYED, IDM_EX_NONE,
+                    "(no .ASM files in the examples folder)");
+}
+
+static void load_example(int index)
+{
+    char path[MAX_PATH * 2];
+    char *text;
+    if (index < 0 || index >= g_exCount) return;
     if (!ask_save_changes()) return;
-    set_editor_text(text, NULL);
-    outf(KO_INFO, "Loaded example %s. Use File > Save As to keep your own copy.", name);
+    snprintf(path, sizeof path, "%s%s", g_exDir, g_exNames[index]);
+    text = read_text_file(path);
+    if (!text) {
+        char msg[MAX_PATH * 2 + 64];
+        snprintf(msg, sizeof msg, "Could not open:\n%s", path);
+        MessageBoxA(g_main, msg, APP_NAME, MB_ICONERROR);
+        return;
+    }
+    /* opened as an unsaved copy, so the file in the examples folder is never changed */
+    set_editor_text(text, NULL, g_exNames[index]);
+    free(text);
+    outf(KO_INFO, "Opened example %s (a copy: File > Save As keeps your own version).", g_exNames[index]);
 }
 
 /* ------------------------------------------------------------------ assemble */
@@ -409,34 +513,59 @@ static char *assemble(int quiet_dump)
         free(text);
     }
     if (!g_outAtLineStart) out_raw(kind_color(KO_INFO), "\n");
-    outf(KO_INFO, "---- Assembling %s ----", g_path[0] ? file_part(g_path) : "(not saved yet)");
+    outf(KO_INFO, "---- Assembling %s ----", g_path[0] ? file_part(g_path) :
+         (g_shownName[0] ? g_shownName : "(not saved yet)"));
     SetCursor(LoadCursor(NULL, IDC_WAIT));
     kit_assemble(src, g_tmpdir, &r);
     SetCursor(LoadCursor(NULL, IDC_ARROW));
 
     if (r.messages) {
+        /* one mistake can give the same error on many lines: show 3 of each kind, count the rest */
+        char codes[48][8];
+        int counts[48], ncodes = 0, hidden = 0;
         char *p = r.messages;
         while (*p) {
             char *e = strchr(p, '\n');
-            char save = 0;
-            const char *shown = p;
+            char save = 0, code[8] = "";
+            const char *shown = p, *a;
             size_t sl = strlen(src);
+            int k, show = 1;
             if (e) { save = *e; *e = 0; }
-            if (_strnicmp(p, src, sl) == 0) {       /* "C:\long\path\X.ASM(7) : ..." -> "X.ASM(7) : ..." */
-                static char tmp[1200];
-                snprintf(tmp, sizeof tmp, "%s%s", g_path[0] ? file_part(g_path) : "UNTITLED.ASM", p + sl);
-                shown = tmp;
+            a = strstr(p, "Error A");
+            if (!a) a = strstr(p, "Warning A");
+            if (a) {
+                a = strchr(a, 'A');
+                snprintf(code, sizeof code, "%.5s", a);
+                for (k = 0; k < ncodes && strcmp(codes[k], code) != 0; k++) ;
+                if (k == ncodes && ncodes < 48) { strcpy(codes[ncodes], code); counts[ncodes++] = 0; }
+                if (k < ncodes && ++counts[k] > 3) { show = 0; hidden++; }
             }
-            outf(strstr(p, "Error") ? KO_ERR : (strstr(p, "Warning") ? KO_WARN : KO_INFO), "%s", shown);
+            if (show) {
+                if (_strnicmp(p, src, sl) == 0) {   /* "C:\long\path\X.ASM(7) : ..." -> "X.ASM(7) : ..." */
+                    static char tmp[1200];
+                    snprintf(tmp, sizeof tmp, "%s%s", g_path[0] ? file_part(g_path) :
+                             (g_shownName[0] ? g_shownName : "UNTITLED.ASM"), p + sl);
+                    shown = tmp;
+                }
+                outf(strstr(p, "Error") ? KO_ERR : (strstr(p, "Warning") ? KO_WARN : KO_INFO), "%s", shown);
+            }
             if (!e) break;
             *e = save;
             p = e + 1;
         }
+        if (hidden)
+            outf(r.errors ? KO_ERR : KO_WARN, "(%d more line(s) with the same error are not shown)", hidden);
+    }
+    if (r.errors)
+        outf(KO_ERR, "%d error(s). Double-click an error line to jump to it, fix it and try again.", r.errors);
+    if (r.messages) {                       /* plain-language hints for the common mistakes */
+        char *text = editor_text();
+        char *hints = kit_hints(r.messages, text);
+        if (hints) { out_lines(KO_HINT, hints); free(hints); }
+        free(text);
     }
     if (!r.ok) {
-        if (r.errors)
-            outf(KO_ERR, "%d error(s). Double-click an error line to jump to it, fix it and try again.", r.errors);
-        else if (r.problem[0])
+        if (!r.errors && r.problem[0])
             outf(KO_ERR, "%s", r.problem);
         kit_asm_free(&r);
         return NULL;
@@ -463,9 +592,19 @@ static char *assemble(int quiet_dump)
         char *dump = kit_hexdump(r.code, r.len, KIT_ORG);
         if (dump) {
             outf(KO_INFO, "Machine code (address: bytes) - also for keypad entry:");
-            out_msg(9, dump);
+            out_msg(KO_DUMP, dump);
             free(dump);
         }
+    }
+    {   /* kit check: run the program on the model of the kit (Assemble: with pictures,
+           Run on Kit: only the warnings) */
+        KitSimReport rep;
+        char *text;
+        SetCursor(LoadCursor(NULL, IDC_WAIT));
+        kit_simulate(r.code, r.len, KIT_ORG, quiet_dump ? 4.0 : 12.0, &rep);
+        SetCursor(LoadCursor(NULL, IDC_ARROW));
+        text = kit_sim_text(&rep, !quiet_dump);
+        if (text) { out_lines(KO_CHECK, text); free(text); }
     }
     kit_asm_free(&r);
     return abs;
@@ -509,15 +648,21 @@ static void do_send_abs(void)
     free(text);
 }
 
-/* jump to the line number found in an assembler message like "X.ASM(12) : Error ..." */
+/* jump to the line number found in an assembler message like "X.ASM(12) : Error ..."
+   or in a hint like "Hint (line 12): ..." */
 static void goto_error_line(const char *line)
 {
     const char *p = strstr(line, ") :");
+    const char *h = strstr(line, "(line ");
     int num = 0;
-    if (!p) return;
-    {
-        const char *q = p - 1;
+    if (h) {
+        for (h += 6; *h >= '0' && *h <= '9'; h++) num = num * 10 + (*h - '0');
+        if (*h != ')' || num <= 0) return;
+    } else {
+        const char *q;
         int mul = 1;
+        if (!p) return;
+        q = p - 1;
         while (q >= line && *q >= '0' && *q <= '9') { num += (*q - '0') * mul; mul *= 10; q--; }
         if (q < line || *q != '(' || num <= 0) return;
     }
@@ -587,14 +732,18 @@ static void set_busy_ui(int busy, const char *port)
 /* ------------------------------------------------------------------ help */
 static const char HELP_TEXT[] =
 "HOW TO USE\r\n\r\n"
-"1. Write a program (or open one, or pick one from the Examples menu).\r\n"
-"   Kit programs look like the lab's samples:\r\n"
-"      CODE SEGMENT / ASSUME CS:CODE / ORG 1000H ... CODE ENDS / END START\r\n"
-"   INT 21H (DOS) does not exist on the kit; talk to the hardware with OUT.\r\n\r\n"
+"1. Write a program, or open one: File > Open, or the Examples menu\r\n"
+"   (it lists the .ASM files in the 'examples' folder next to KitStudio.exe).\r\n"
+"   Kit programs start at address 1000H: put ORG 1000H before the first\r\n"
+"   instruction. The kit has no DOS, so INT 21H does not work there;\r\n"
+"   programs talk to the hardware with OUT and usually loop forever.\r\n\r\n"
 "2. Assemble (F7): errors are shown in red with the line number.\r\n"
 "   Double-click an error to jump to that line.\r\n"
 "   The machine code is shown too (useful for keypad entry and lab reports),\r\n"
-"   and NAME.ABS is saved next to your NAME.ASM.\r\n\r\n"
+"   and NAME.ABS is saved next to your NAME.ASM.\r\n"
+"   Kit check: the program also runs for a few seconds on a built-in model of\r\n"
+"   the kit. The output shows what the dot matrix / 7-segment would show and\r\n"
+"   warns about ports that are not on the kit, a missing 8255 setup, INT 21H.\r\n\r\n"
 "3. Run on Kit (F5): assembles, finds the kit, sends the program (L command)\r\n"
 "   and starts it at 0000:1000 (G command).\r\n"
 "   On the kit: SELECT MODE switch = PC. If the kit does not answer,\r\n"
@@ -751,15 +900,9 @@ static HMENU make_menu(void)
     AppendMenuA(m, MF_STRING, IDM_FIND, "&Find kit (connect)");
     AppendMenuA(m, MF_STRING, IDM_CLEAR, "&Clear output");
     AppendMenuA(bar, MF_POPUP, (UINT_PTR)m, "&Kit");
-    m = CreatePopupMenu();
-    AppendMenuA(m, MF_STRING, IDM_EX_K28, "7-segment: digits 0 to 9");
-    AppendMenuA(m, MF_STRING, IDM_EX_K27A, "Dot matrix: letter A");
-    AppendMenuA(m, MF_STRING, IDM_EX_K27, "Dot matrix: A scrolls left to right");
-    AppendMenuA(m, MF_STRING, IDM_EX_SIZAN, "Dot matrix: scrolling text SIZAN");
-    AppendMenuA(m, MF_STRING, IDM_EX_JOY, "Dot matrix: scrolling text JOY");
-    AppendMenuA(m, MF_SEPARATOR, 0, NULL);
-    AppendMenuA(m, MF_STRING, IDM_EX_TEMPLATE, "Empty kit program (template)");
-    AppendMenuA(bar, MF_POPUP, (UINT_PTR)m, "E&xamples");
+    g_exMenu = CreatePopupMenu();         /* filled from the examples folder when it opens */
+    AppendMenuA(g_exMenu, MF_STRING | MF_GRAYED, IDM_EX_NONE, "(no .ASM files in the examples folder)");
+    AppendMenuA(bar, MF_POPUP, (UINT_PTR)g_exMenu, "E&xamples");
     m = CreatePopupMenu();
     AppendMenuA(m, MF_STRING, IDM_HELP, "&How to use\tF1");
     AppendMenuA(m, MF_STRING, IDM_HELP_CONN, "&Connecting the kit");
@@ -853,6 +996,10 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         update_line_col();
         return 0;
 
+    case WM_INITMENUPOPUP:
+        if ((HMENU)wp == g_exMenu) fill_examples_menu();
+        break;
+
     case WM_KITTEXT:
         out_msg((int)wp, (const char *)lp);
         free((void *)lp);
@@ -921,7 +1068,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             return 0;
         case IDC_REFRESH: fill_ports(); return 0;
         case IDM_NEW:
-            if (ask_save_changes()) { set_editor_text(ex_template, NULL); }
+            if (ask_save_changes()) set_editor_text("", NULL, NULL);
             return 0;
         case IDM_OPEN: do_open(); return 0;
         case IDM_SAVE: do_save(); return 0;
@@ -953,25 +1100,25 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             SetFocus(g_cmd);
             return 0;
         }
-        case IDM_EX_K28: load_example(ex_k28, "7-segment 0-9 (K28)"); return 0;
-        case IDM_EX_K27A: load_example(ex_k27a, "dot matrix A (K27_A)"); return 0;
-        case IDM_EX_K27: load_example(ex_k27, "dot matrix A scrolls (K27)"); return 0;
-        case IDM_EX_SIZAN: load_example(ex_sizan, "scrolling SIZAN"); return 0;
-        case IDM_EX_JOY: load_example(ex_joy, "scrolling JOY"); return 0;
-        case IDM_EX_TEMPLATE:
-            if (ask_save_changes()) set_editor_text(ex_template, NULL);
-            return 0;
         case IDM_HELP: show_text_box("How to use - " APP_NAME, HELP_TEXT); return 0;
         case IDM_HELP_CONN: show_text_box("Connecting the kit", CONN_TEXT); return 0;
         case IDM_ABOUT:
             show_text_box("About",
-                APP_NAME " 1.0\r\n\r\n"
+                APP_NAME " " APP_VERSION "\r\n\r\n"
                 "Write, assemble and run programs on the Midas MDA-8086 trainer kit.\r\n"
                 "Works on Windows XP, 7, 8, 10, 11 (32 and 64 bit).\r\n\r\n"
                 "Built-in assembler: JWasm (MASM compatible), Sybase Open Watcom\r\n"
                 "Public License 1.0 - source included with this program.\r\n"
-                "Its output for kit programs matches the lab's TASM + LINK + MEXE2ABS.");
+                "Its output for kit programs matches the lab's TASM + LINK + MEXE2ABS.\r\n\r\n"
+                "The kit check after Assemble runs the program on a built-in 8086\r\n"
+                "model of the kit (dot matrix and 7-segment), without the kit.");
             return 0;
+        default:
+            if (id >= IDM_EX_FIRST && id < IDM_EX_FIRST + MAX_EXAMPLES) {
+                load_example(id - IDM_EX_FIRST);
+                return 0;
+            }
+            break;
         }
         break;
     }
@@ -1023,6 +1170,15 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
     strcat(g_tmpdir, "KitStudio\\");
     CreateDirectoryA(g_tmpdir, NULL);
 
+    n = GetModuleFileNameA(NULL, g_exDir, sizeof g_exDir - 16);
+    if (n == 0 || n >= sizeof g_exDir - 16) {
+        strcpy(g_exDir, ".\\examples\\");
+    } else {
+        char *slash = strrchr(g_exDir, '\\');
+        if (slash) slash[1] = 0; else g_exDir[0] = 0;
+        strcat(g_exDir, "examples\\");
+    }
+
     InitializeCriticalSection(&g_cs);
     g_wake = CreateEventA(NULL, FALSE, FALSE, NULL);
 
@@ -1043,10 +1199,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
     if (!g_main) return 1;
     g_accel = CreateAcceleratorTableA(acc, sizeof acc / sizeof acc[0]);
 
-    set_editor_text(ex_k28, NULL);
-    outf(KO_INFO, APP_NAME " - write a program, press F7 to assemble, F5 to run it on the kit.");
-    outf(KO_INFO, "Kit: SELECT MODE switch = PC. If it does not answer, press RESET on the kit.");
-    outf(KO_INFO, "The 7-segment example is loaded. More in the Examples menu. Help: F1.");
+    set_editor_text("", NULL, NULL);       /* always start with an empty editor */
+    outf(KO_INFO, APP_NAME " " APP_VERSION " - write a program, press F7 to assemble, F5 to run it on the kit.");
+    outf(KO_INFO, "Kit: SELECT MODE switch = PC. If it does not answer, press RESET on the kit. Help: F1.");
     fill_ports();
     set_busy_ui(0, NULL);
     if (__argc > 1) open_path(__argv[1]);

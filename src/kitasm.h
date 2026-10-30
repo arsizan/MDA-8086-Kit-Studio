@@ -12,7 +12,7 @@ typedef struct {
     char          *messages;    /* assembler messages, '\n' separated (malloc'd, may be NULL) */
     unsigned char *code;        /* bytes for 0000:1000 onwards (malloc'd, NULL if failed) */
     int            len;         /* number of bytes in code */
-    char           problem[256];/* short explanation when ok == 0 and errors == 0 */
+    char           problem[512];/* short explanation when ok == 0 and errors == 0 */
 } KitAsmResult;
 
 /* Assemble source file 'src'. 'tmpdir' must be a writable folder (with or
