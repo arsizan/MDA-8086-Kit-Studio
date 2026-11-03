@@ -6,16 +6,24 @@ It behaves like the lab's kit as seen in the real kit's log:
   ("Down load start !!" ... "OK Completed !!"), G command ("Execute Address = ..."),
   D dump. After G the "program runs": the monitor is silent until RESET.
 
-Usage: fakekit.py STATEDIR [--silent-until-reset] [--dead-port]
+Usage: fakekit.py STATEDIR [--silent-until-reset] [--dead-port] [--nul=g,late,crlf]
   writes STATEDIR/port (pty path to give to the program under test),
   STATEDIR/memory.json after each download, STATEDIR/log.txt (everything received).
   touch STATEDIR/reset  -> simulate pressing RESET (PC mode).
   touch STATEDIR/quit   -> exit.
+  --nul adds invisible NUL bytes to what the kit sends (a real terminal does not show them):
+    g    = a NUL in the G answer, before "Execute Address"
+    late = a NUL 30 ms after the prompt that follows "OK Completed"
+    crlf = a NUL after every CR LF (teletype padding)
 """
 import os, sys, json, time, tty, select
 
 state_dir = sys.argv[1]
 silent = '--silent-until-reset' in sys.argv
+nul = set()
+for a in sys.argv[2:]:
+    if a.startswith('--nul='):
+        nul = set(a[6:].split(','))
 os.makedirs(state_dir, exist_ok=True)
 
 master, slave = os.openpty()
@@ -36,6 +44,8 @@ line = ''
 events = []
 
 def send(s):
+    if 'crlf' in nul:
+        s = s.replace('\r\n', '\r\n\0')
     os.write(master, s.encode('latin-1'))
 
 def banner():
@@ -60,7 +70,7 @@ def command(cmd):
         mode = 'download'
     elif u.startswith('G'):
         arg = c[1:].strip() or '0000:1000'
-        send('\r\n\r\nExecute Address = %s \r\n' % arg.upper())
+        send(('\r\n\0\r\n' if 'g' in nul else '\r\n\r\n') + 'Execute Address = %s \r\n' % arg.upper())
         mode = 'running'
     elif u.startswith('D'):
         parts = c[1:].split()
@@ -98,6 +108,9 @@ def hexline(l):
     elif b[3] == 1:
         save_memory()
         send('\r\n   OK Completed !!\r\n\r\n8086 >')
+        if 'late' in nul:
+            time.sleep(0.03)
+            send('\0')
         mode = 'monitor'
 
 if not silent:

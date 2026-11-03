@@ -989,10 +989,19 @@ static void make_frames(Sim *c)
         }
         if (!stable) continue;
         if (g | rr) {
-            int k, cnt = 0;
-            for (k = 0; k < 64; k++) if (((g | rr) >> k) & 1) cnt++;
+            /* mistakes that light (almost) everything: one colour's rows left at 0 (= on),
+               e.g. red port not set to 0FFH, or a table with 1 = on, or DS wrong. A full
+               picture made of several colours (e.g. coloured rows) is not a mistake. */
+            int k, cnt, ng = 0, nr = 0, nb = 0, most;
+            for (k = 0; k < 64; k++) {
+                int gg = (int)((g >> k) & 1), rd = (int)((rr >> k) & 1);
+                if (gg && rd) nb++; else if (gg) ng++; else if (rd) nr++;
+            }
+            cnt = ng + nr + nb;
+            most = ng > nr ? ng : nr;
+            if (nb > most) most = nb;
             lit_windows++;
-            if (cnt >= 48) lit_total++;
+            if (ng + nb >= 56 || nr + nb >= 56 || (cnt >= 48 && most * 10 >= cnt * 9)) lit_total++;
             if (rr) r->dm_red = 1;
         }
         if (have_last && g == lastg && rr == lastr) continue;
@@ -1209,7 +1218,7 @@ char *kit_sim_text(const KitSimReport *r, int picture)
                 put(&o, "\n");
             }
         }
-        if (r->dm_red) put(&o, "    (# = green, R = red, @ = both)\n");
+        if (r->dm_red) put(&o, "    (# = green, R = red, @ = both = yellow)\n");
         if (r->ndigits > 0) {
             char t[16];
             put(&o, "  7-segment shows:");

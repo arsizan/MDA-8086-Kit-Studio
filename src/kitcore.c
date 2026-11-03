@@ -7,6 +7,9 @@
  *                              after the end record: "OK Completed !!" + prompt
  *   "G 0000:1000\r"         -> "Execute Address = 0000:1000", program runs
  * Characters are sent with a small gap (2 ms) so the kit never misses one.
+ * The words above are searched only in the visible characters the kit sent: an invisible
+ * byte such as NUL must not hide them (1.1 said "did not confirm the start" on the lab's
+ * kit although "Execute Address" was on the screen).
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,6 +25,55 @@ typedef struct {
     int  len;
 } Acc;
 
+/* ---- raw serial log (for finding out what a real kit sends) ---- */
+#define LOG_LIMIT 2000000L
+
+void kit_set_log(KitLink *k, FILE *f)
+{
+    k->log = f;
+    k->log_t0 = kp_ms();
+    k->log_size = 0;
+}
+
+static void log_line(KitLink *k, const char *fmt, ...)
+{
+    va_list ap;
+    int n;
+    if (!k->log) return;
+    if (k->log_size > LOG_LIMIT) {
+        fprintf(k->log, "(log limit reached, nothing more is written in this session)\n");
+        fflush(k->log);
+        k->log = NULL;
+        return;
+    }
+    n = fprintf(k->log, "[%9.3f] ", (unsigned)(kp_ms() - k->log_t0) / 1000.0);
+    va_start(ap, fmt);
+    n += vfprintf(k->log, fmt, ap);
+    va_end(ap);
+    fputc('\n', k->log);
+    fflush(k->log);
+    if (n > 0) k->log_size += n + 1;
+}
+
+/* bytes as hex, 16 per line, with the printable characters beside them */
+static void log_bytes(KitLink *k, const char *dir, const char *s, int n)
+{
+    int i, j;
+    if (!k->log) return;
+    for (i = 0; i < n; i += 16) {
+        char hex[16 * 3 + 1], asc[17];
+        int m = n - i < 16 ? n - i : 16;
+        for (j = 0; j < m; j++) {
+            unsigned char c = (unsigned char)s[i + j];
+            snprintf(hex + j * 3, 4, "%02X ", c);
+            asc[j] = (c >= 32 && c < 127) ? (char)c : '.';
+        }
+        hex[m * 3] = 0;
+        asc[m] = 0;
+        log_line(k, "%s %-48s %s", dir, hex, asc);
+    }
+}
+
 static void say(KitLink *k, int kind, const char *fmt, ...)
 {
     char buf[1024];
@@ -29,6 +81,7 @@ static void say(KitLink *k, int kind, const char *fmt, ...)
     va_start(ap, fmt);
     vsnprintf(buf, sizeof buf, fmt, ap);
     va_end(ap);
+    if (kind != KO_KIT) log_line(k, "-- %s", buf);
     if (k->out) k->out(k->ctx, kind, buf);
 }
 
@@ -52,19 +105,22 @@ static const char *stristr(const char *h, const char *n)
     return NULL;
 }
 
+/* remember kit text for the word searches. Only what the output pane can show is kept
+   (printable characters, CR, LF, TAB): a NUL or other control byte is invisible on the
+   screen, but in the text it would end the C string and hide every word after it. */
 static void acc_add(Acc *a, const char *s, int n)
 {
-    if (n >= (int)sizeof a->txt - 1) {
-        s += n - (int)(sizeof a->txt - 1);
-        n = (int)sizeof a->txt - 1;
+    int i;
+    for (i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c != '\r' && c != '\n' && c != '\t' && (c < 32 || c > 126)) continue;
+        if (a->len >= (int)sizeof a->txt - 1) {         /* full: keep the newest half */
+            int keep = (int)sizeof a->txt / 2;
+            memmove(a->txt, a->txt + a->len - keep, keep);
+            a->len = keep;
+        }
+        a->txt[a->len++] = (char)c;
     }
-    if (a->len + n >= (int)sizeof a->txt) {
-        int drop = a->len + n - (int)(sizeof a->txt - 1);
-        memmove(a->txt, a->txt + drop, a->len - drop);
-        a->len -= drop;
-    }
-    memcpy(a->txt + a->len, s, n);
-    a->len += n;
     a->txt[a->len] = 0;
 }
 
@@ -94,8 +150,9 @@ static int pump(KitLink *k, KitPort *p, Acc *acc, int show)
     int total = 0;
     for (;;) {
         int n = kp_read(p, raw, sizeof raw);
-        if (n < 0) return -1;
+        if (n < 0) { log_line(k, "RX failed (port stopped working)"); return -1; }
         if (n == 0) break;
+        log_bytes(k, "RX", raw, n);
         total += n;
         if (acc) acc_add(acc, raw, n);
         if (show) {
@@ -125,6 +182,7 @@ static int wait_for(KitLink *k, KitPort *p, Acc *acc, const char *const *words, 
 static int send_slow(KitLink *k, KitPort *p, const char *s, Acc *acc, int show)
 {
     int i = 0;
+    log_bytes(k, "TX", s, (int)strlen(s));
     for (; s[i]; i++) {
         if (kp_write(p, s + i, 1) != 1) return -1;
         kp_wait_us(CHAR_GAP_US);
@@ -141,6 +199,8 @@ static int test_port(KitLink *k, KitPort *p)
     Acc acc;
     acc.len = 0; acc.txt[0] = 0;
     kp_flush_input(p);
+    log_line(k, "test %s: input flushed", kp_name(p));
+    log_bytes(k, "TX", "\r", 1);
     if (kp_write(p, "\r", 1) != 1) return 0;
     return wait_for(k, p, &acc, PROMPT_WORDS, 2, 800, 0) >= 0;
 }
@@ -237,7 +297,10 @@ int kit_find(KitLink *k, int allow_wait)
             if ((int)(kp_ms() - t0) >= wait_ms) break;
             if ((int)(kp_ms() - poke) >= 2000) {
                 for (i = 0; i < nopen; i++)
-                    if (open[i]) kp_write(open[i], "\r", 1);
+                    if (open[i]) {
+                        log_line(k, "TX 0D (Enter) on %s", kp_name(open[i]));
+                        kp_write(open[i], "\r", 1);
+                    }
                 poke = kp_ms();
             }
             kp_sleep(50);
@@ -318,6 +381,7 @@ int kit_download(KitLink *k, const char *abs, int *nbytes)
     say(k, KO_INFO, "Sending %d bytes to the kit (L command) ...", bytes);
     acc.len = 0; acc.txt[0] = 0;
     kp_flush_input(k->port);
+    log_line(k, "input flushed");
     k->cr_pending = 0;
     if (send_slow(k, k->port, "L\r", &acc, 1) < 0) goto port_failed;
     r = wait_for(k, k->port, &acc, START, 1, 2000, 1);
@@ -387,7 +451,9 @@ int kit_go(KitLink *k, unsigned seg, unsigned off)
         return 1;
     }
     if (r == -3) { say(k, KO_ERR, "The COM port stopped working."); kit_disconnect(k); return 0; }
-    say(k, KO_WARN, "The kit did not confirm the start (no \"Execute Address\").");
+    if (r == -2) { say(k, KO_WARN, "Stopped."); return 0; }
+    say(k, KO_WARN, "The kit did not answer \"Execute Address\" to the G command.\n"
+        "If the program is not running, press RESET on the kit and press Run again.");
     return 0;
 }
 

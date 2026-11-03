@@ -257,7 +257,7 @@ static char *clean_messages(char *raw, int *errors, int *warnings)
 int kit_assemble(const char *src, const char *tmpdir, KitAsmResult *res)
 {
     char exe[1024], err[1024], fo[1100], fw[1100], fsrc[1100];
-    const char *argv[8];
+    const char *argv[9];
     int numargs = 0;
     volatile int rc = 0, files = 0;
     long n;
@@ -284,10 +284,11 @@ int kit_assemble(const char *src, const char *tmpdir, KitAsmResult *res)
     argv[1] = "-mz";       /* MZ executable, like LINK makes */
     argv[2] = "-Zm";       /* MASM 5.1 compatible, as the lab's samples need */
     argv[3] = "-q";        /* quiet: no banner / summary */
-    argv[4] = fo;
-    argv[5] = fw;
-    argv[6] = fsrc;
-    argv[7] = NULL;
+    argv[4] = "-eq";       /* messages only into the .err file, not on the console (Linux terminal) */
+    argv[5] = fo;
+    argv[6] = fw;
+    argv[7] = fsrc;
+    argv[8] = NULL;
 
     if (setjmp(jw_env) == 0) {
         char *name;

@@ -1,6 +1,7 @@
 /* kitcore.h - talk to the MDA-8086 serial monitor ("8086 >" prompt) */
 #ifndef KITCORE_H
 #define KITCORE_H
+#include <stdio.h>
 #include "kitport.h"
 
 enum { KO_INFO, KO_OK, KO_WARN, KO_ERR, KO_KIT };
@@ -15,9 +16,14 @@ typedef struct {
     int            wait_reset_ms;   /* how long to wait for RESET (default 60000) */
     KitPort       *port;            /* the kit's port while connected */
     int            cr_pending;      /* newline handling between reads */
+    FILE          *log;             /* raw serial log (bytes in hex), or NULL */
+    unsigned       log_t0;
+    long           log_size;
 } KitLink;
 
 void kit_init(KitLink *k, KitOutFn out, void *ctx, volatile long *cancel);
+/* write every byte sent/received and every message to f (opened by the caller) */
+void kit_set_log(KitLink *k, FILE *f);
 /* make sure k->port is a kit that answers; may ask the user to press RESET */
 int  kit_find(KitLink *k, int allow_wait);
 /* L command + Intel HEX records from 'abs' text; 1 = kit said "Completed" */

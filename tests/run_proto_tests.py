@@ -16,7 +16,9 @@ def abs_bytes(path):
                 for i in range(b[0]): mem[a + i] = b[4 + i]
     return mem
 
-def scenario(name, kit_args, test_args, reset_at=None, expect_rc=0, check_mem=True):
+def scenario(name, kit_args, test_args, reset_at=None, expect_rc=0, check_mem=True, direct=False):
+    if os.environ.get('ONLY') and os.environ['ONLY'] not in name:     # ONLY=text runs matching scenarios
+        return True
     d = tempfile.mkdtemp(prefix='fk_')
     fk = subprocess.Popen([sys.executable, os.path.join(here, 'fakekit.py'), d] + kit_args)
     for _ in range(100):
@@ -27,6 +29,8 @@ def scenario(name, kit_args, test_args, reset_at=None, expect_rc=0, check_mem=Tr
     if '--dead-port' in kit_args:
         ports = [open(os.path.join(d, 'deadport')).read(), port]   # dead port first
     env = dict(os.environ)
+    if direct:
+        env['KIT_TEST_DIRECT'] = '1'
     if wine:
         # map COM1, COM2 to the ptys (Wine reads HKLM\Software\Wine\Ports at start)
         for i in range(1, 4):
@@ -68,4 +72,9 @@ res.append(scenario('dead port first, kit second', ['--dead-port'], []))
 res.append(scenario('kit silent, user presses RESET after 3 s', ['--silent-until-reset'], [], reset_at=3))
 res.append(scenario('kit silent, no wait allowed', ['--silent-until-reset'], ['nowait'], expect_rc=1, check_mem=False))
 res.append(scenario('user presses Stop while waiting', ['--silent-until-reset'], ['wait', '2500'], expect_rc=1, check_mem=False))
+# invisible NUL bytes from the kit must not hide the words the program waits for
+res.append(scenario('NUL in the G answer before "Execute"', ['--nul=g'], [], direct=True))
+res.append(scenario('late NUL after the download prompt', ['--nul=late'], [], direct=True))
+res.append(scenario('NUL after every CR LF', ['--nul=crlf'], []))
+res.append(scenario('NULs everywhere + RESET after 3 s', ['--silent-until-reset', '--nul=g,late,crlf'], [], reset_at=3, direct=True))
 print('ALL PASS' if all(res) else 'SOME FAILED')

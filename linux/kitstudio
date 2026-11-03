@@ -1,0 +1,27 @@
+#!/bin/sh
+# MDA-8086 Kit Studio - starts the program made for this PC (64-bit or 32-bit, Intel or AMD).
+here="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")" && pwd)"
+case "$(uname -m)" in
+  x86_64|amd64)
+    if [ -e /lib64/ld-linux-x86-64.so.2 ] || [ -e /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 ]; then
+      exe=kitstudio-x86_64
+    else
+      exe=kitstudio-i386            # 64-bit kernel with a 32-bit system
+    fi ;;
+  i386|i486|i586|i686|x86)
+    exe=kitstudio-i386 ;;
+  *)
+    echo "MDA-8086 Kit Studio runs on Intel/AMD (x86) PCs; this PC is $(uname -m)."
+    exit 1 ;;
+esac
+"$here/bin/$exe" "$@"
+rc=$?
+if [ "$rc" = 127 ]; then
+  echo
+  echo "Kit Studio needs GTK 3 (most Linux desktops have it). Install it, for example:"
+  echo "  Ubuntu, Debian, Mint:  sudo apt install libgtk-3-0"
+  echo "  Fedora:                sudo dnf install gtk3"
+  echo "  Arch, Manjaro:         sudo pacman -S gtk3"
+  echo "  openSUSE:              sudo zypper install libgtk-3-0"
+fi
+exit "$rc"

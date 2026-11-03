@@ -1,5 +1,7 @@
 /* kittest: drive kitcore against a (fake) kit.  kittest FILE.ABS [nowait] [cancel_after_ms]
-   Ports come from KIT_TEST_PORTS (POSIX build) or the system (Windows build). */
+   Ports come from KIT_TEST_PORTS (POSIX build) or the system (Windows build).
+   KIT_TEST_LOG=file  -> raw serial log;  KIT_TEST_DIRECT=1 -> G right after the download
+   (as the program's Run button does), without the D command in between. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,6 +38,10 @@ int main(int argc, char **argv)
 #endif
     }
     kit_init(&k, out, NULL, &cancel_flag);
+    if (getenv("KIT_TEST_LOG")) {
+        FILE *lf = fopen(getenv("KIT_TEST_LOG"), "a");
+        if (lf) kit_set_log(&k, lf);
+    }
     if (getenv("KIT_PORT")) snprintf(k.want, sizeof k.want, "%s", getenv("KIT_PORT"));
     k.wait_reset_ms = 15000;
     ok = kit_find(&k, !(argc > 2 && strcmp(argv[2], "nowait") == 0));
@@ -44,8 +50,10 @@ int main(int argc, char **argv)
     ok = kit_download(&k, abs, &bytes);
     printf("\n== download=%d bytes=%d\n", ok, bytes);
     if (!ok) return 1;
-    kit_command(&k, "D 0000:1000 30");
-    { unsigned t0 = kp_ms(); while (kp_ms() - t0 < 800) { kit_poll(&k); kp_sleep(20); } }
+    if (!getenv("KIT_TEST_DIRECT")) {
+        kit_command(&k, "D 0000:1000 30");
+        { unsigned t0 = kp_ms(); while (kp_ms() - t0 < 800) { kit_poll(&k); kp_sleep(20); } }
+    }
     ok = kit_go(&k, 0, 0x1000);
     printf("\n== go=%d\n", ok);
     kit_disconnect(&k);
