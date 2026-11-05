@@ -37,6 +37,14 @@ const char KITUI_HELP[] =
 "      D 0000:1000 40      (show memory)\n"
 "      R                   (show registers)\n"
 "      G 0000:1000         (start a program)\n\n"
+"5. Simulator (right side, without the kit): Run (F6) runs the program on a\n"
+"   model of the kit and shows the dot matrix, 7-segment, LEDs, LCD, registers\n"
+"   and 8255 ports live. Step (F8) runs one instruction and marks the next line\n"
+"   in the editor. Pause (F9) stops, Reset starts again from 1000H.\n"
+"   Speed 1x = the real kit; slow motion shows how the columns are scanned.\n"
+"   Simulator > Separate window puts it in its own window, like emu8086\n"
+"   (on small screens this happens by itself); closing that window brings it\n"
+"   back. Simulator > Show simulator panel hides or shows it.\n\n"
 "Kit > Send .ABS file sends a ready .ABS file (e.g. the lab's sample programs).";
 
 #ifdef _WIN32
@@ -85,8 +93,9 @@ APP_NAME " " APP_VERSION "\n\n"
 "Built-in assembler: JWasm (MASM compatible), Sybase Open Watcom\n"
 "Public License 1.0 - source included with this program.\n"
 "Its output for kit programs matches the lab's TASM + LINK + MEXE2ABS.\n\n"
-"The kit check after Assemble runs the program on a built-in 8086\n"
-"model of the kit (dot matrix and 7-segment), without the kit.";
+"The kit check after Assemble and the Simulator panel run the program\n"
+"on a built-in 8086 model of the kit (dot matrix, 7-segment, LEDs, LCD),\n"
+"without the kit.";
 
 /* ------------------------------------------------------------------ helpers */
 const char *kitui_file_part(const char *path)
@@ -143,7 +152,7 @@ static int write_file(const char *path, const char *text)
 
 /* ------------------------------------------------------------------ assemble */
 char *kitui_assemble(const char *src, const char *shown, const char *source, const char *tmpdir,
-                     const char *asm_path, int quiet, KitUiOut out)
+                     const char *asm_path, int quiet, KitUiOut out, KitUiProgram *prog)
 {
     KitAsmResult r;
     char *abs;
@@ -229,8 +238,114 @@ char *kitui_assemble(const char *src, const char *shown, const char *source, con
         text = kit_sim_text(&rep, !quiet);
         if (text) { lines(out, KO_CHECK, text); free(text); }
     }
+    if (prog) {                     /* hand the bytes and the line map to the simulator */
+        prog->code = r.code; prog->len = r.len; prog->lines = r.lines;
+        r.code = NULL; r.lines = NULL;
+    }
     kit_asm_free(&r);
     return abs;
+}
+
+/* ------------------------------------------------------------------ simulator panel */
+void kitui_free_program(KitUiProgram *p)
+{
+    free(p->code);
+    free(p->lines);
+    p->code = NULL; p->lines = NULL; p->len = 0;
+}
+
+void kitsim_unload(KitSimCtl *s)
+{
+    km_free(s->m);
+    s->m = NULL;
+    kitui_free_program(&s->prog);
+    free(s->source);
+    s->source = NULL;
+    s->panel.have = 0;
+    s->panel.running = 0;
+    s->panel.line = 0;
+    s->panel.line_text[0] = 0;
+    memset(&s->panel.v, 0, sizeof s->panel.v);
+    s->panel.v.stop = -1;
+    s->panel.v.lcd_on = 1;
+    memset(s->panel.v.lcd, ' ', sizeof s->panel.v.lcd);
+    s->panel.v.lcd[0][16] = s->panel.v.lcd[1][16] = 0;
+}
+
+void kitsim_load(KitSimCtl *s, KitUiProgram *prog, const char *source)
+{
+    size_t n = source ? strlen(source) : 0;
+    double speed = s->panel.speed > 0 ? s->panel.speed : 1.0;
+    kitsim_unload(s);
+    s->prog = *prog;
+    prog->code = NULL; prog->lines = NULL; prog->len = 0;
+    s->source = (char *)malloc(n + 1);
+    if (s->source) { if (n) memcpy(s->source, source, n); s->source[n] = 0; }
+    s->m = km_new(s->prog.code, s->prog.len, KIT_ORG);
+    s->panel.have = s->m != NULL;
+    s->panel.speed = speed;
+    kitsim_update(s);
+}
+
+int kitsim_same_source(const KitSimCtl *s, const char *source)
+{
+    return s->m && s->source && source && strcmp(s->source, source) == 0;
+}
+
+void kitsim_tick(KitSimCtl *s, double real_seconds)
+{
+    double cyc;
+    if (!s->m || !s->panel.running) return;
+    if (real_seconds > 0.2) real_seconds = 0.2;          /* after a pause of the window */
+    cyc = real_seconds * s->panel.speed * SIM_CLOCK;
+    if (cyc < 1) cyc = 1;
+    if (km_run(s->m, (unsigned long long)cyc) >= 0) s->panel.running = 0;
+}
+
+void kitsim_step(KitSimCtl *s)
+{
+    if (!s->m) return;
+    s->panel.running = 0;
+    km_step(s->m);
+}
+
+void kitsim_reset(KitSimCtl *s)
+{
+    if (!s->m) return;
+    s->panel.running = 0;
+    km_reset(s->m);
+}
+
+/* source line n (1-based) of text, tabs as spaces, without the comment's end spaces */
+static void source_line(const char *text, int n, char *out, int size)
+{
+    const char *p = text;
+    int line = 1, k = 0, col = 0;
+    out[0] = 0;
+    if (!text || n < 1) return;
+    while (*p && line < n) { if (*p == '\n') line++; p++; }
+    while (*p == ' ' || *p == '\t') p++;              /* no indent */
+    for (; *p && *p != '\n' && *p != '\r' && k < size - 1; p++) {
+        if (*p == '\t') { do { out[k++] = ' '; col++; } while ((col & 7) && k < size - 1); }
+        else { out[k++] = *p; col++; }
+    }
+    while (k > 0 && out[k - 1] == ' ') k--;
+    out[k] = 0;
+}
+
+void kitsim_update(KitSimCtl *s)
+{
+    KitPanel *p = &s->panel;
+    unsigned ip;
+    if (!s->m) return;
+    km_view(s->m, &p->v);
+    p->line = 0;
+    p->line_text[0] = 0;
+    ip = (unsigned)p->v.cs * 16 + p->v.ip;
+    if (s->prog.lines && ip >= KIT_ORG && ip < KIT_ORG + (unsigned)s->prog.len) {
+        p->line = s->prog.lines[ip - KIT_ORG];
+        if (p->line) source_line(s->source, p->line, p->line_text, sizeof p->line_text);
+    }
 }
 
 /* ------------------------------------------------------------------ error lines */

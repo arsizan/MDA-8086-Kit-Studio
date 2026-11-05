@@ -34,10 +34,12 @@
 enum {
     IDC_EDIT = 100, IDC_OUT, IDC_CMD, IDC_STATUS, IDC_PORT,
     IDC_ASM, IDC_RUN, IDC_STOP, IDC_REFRESH, IDC_SEND, IDC_PORTLBL,
+    IDC_SIMVIEW, IDC_SIMRUN, IDC_SIMSTEP, IDC_SIMPAUSE, IDC_SIMRESET, IDC_SPEED, IDC_SPEEDLBL,
     IDM_NEW = 200, IDM_OPEN, IDM_SAVE, IDM_SAVEAS, IDM_EXIT,
     IDM_UNDO, IDM_CUT, IDM_COPY, IDM_PASTE, IDM_SELALL,
     IDM_ASM, IDM_RUN, IDM_SENDABS, IDM_STOP, IDM_FIND, IDM_CLEAR,
     IDM_HELP, IDM_HELP_CONN, IDM_KITLOG, IDM_ABOUT,
+    IDM_SIMRUN, IDM_SIMSTEP, IDM_SIMPAUSE, IDM_SIMRESET, IDM_SIMPANEL, IDM_SIMFLOAT,
     IDM_EX_FIRST = 300,             /* 300.. : built-in examples (kit_examples[]) */
     IDM_TPL_FIRST = 340             /* 340.. : built-in templates (kit_templates[]) */
 };
@@ -48,6 +50,14 @@ enum { JOB_NONE, JOB_RUN, JOB_CMD, JOB_FIND, JOB_PORT };
 static HINSTANCE g_inst;
 static HWND g_main, g_edit, g_out, g_cmd, g_status, g_port, g_btnAsm, g_btnRun, g_btnStop,
             g_btnRefresh, g_btnSend, g_portLbl;
+/* Simulator panel (right side) */
+static HWND g_simView, g_btnSimRun, g_btnSimStep, g_btnSimPause, g_btnSimReset, g_speed, g_speedLbl;
+static KitSimCtl g_sim;
+static int g_simShown = 1, g_speedIdx = 6;
+static HWND g_simWin;              /* Simulator > Separate window: the panel in its own window */
+static int g_simFloat, g_narrow;   /* g_narrow: screen too small for both side by side */
+static DWORD g_simTick;
+static const double SPEEDS[7] = { 1.0 / 1000, 1.0 / 300, 1.0 / 100, 1.0 / 30, 1.0 / 10, 1.0 / 3, 1.0 };
 static HFONT g_fontMono, g_fontUI;
 static HACCEL g_accel;
 static int g_dpi = 96;
@@ -464,8 +474,8 @@ static void load_builtin(const KitBuiltin *b, int is_template)
 /* ------------------------------------------------------------------ assemble */
 static void ui_out(int kind, const char *text) { out_msg(kind, text); }
 
-/* assembles the editor text; on success returns malloc'd .ABS text */
-static char *assemble(int quiet_dump)
+/* assembles the editor text; on success returns malloc'd .ABS text (prog: for the simulator) */
+static char *assemble_ex(int quiet_dump, KitUiProgram *prog)
 {
     char src[MAX_PATH];
     char *abs, *text;
@@ -489,11 +499,13 @@ static char *assemble(int quiet_dump)
     text = editor_text();
     SetCursor(LoadCursor(NULL, IDC_WAIT));
     abs = kitui_assemble(src, g_path[0] ? file_part(g_path) : (g_shownName[0] ? g_shownName : "UNTITLED.ASM"),
-                         text, g_tmpdir, g_path[0] ? g_path : NULL, quiet_dump, ui_out);
+                         text, g_tmpdir, g_path[0] ? g_path : NULL, quiet_dump, ui_out, prog);
     SetCursor(LoadCursor(NULL, IDC_ARROW));
     free(text);
     return abs;
 }
+
+static char *assemble(int quiet_dump) { return assemble_ex(quiet_dump, NULL); }
 
 static void do_run(void)
 {
@@ -608,11 +620,424 @@ static void show_text_box(const char *title, const char *text)
     MessageBoxA(g_main, text, title, MB_OK | MB_ICONINFORMATION);
 }
 
+static void layout(void);
+/* ------------------------------------------------------------------ simulator panel */
+/* GDI+ draws smooth circles and shapes (Windows XP and later have it); without it, plain GDI */
+typedef struct { UINT32 ver; void *cb; BOOL nothread, nocodecs; } GpInput;
+typedef int (WINAPI *GpStartup_t)(ULONG_PTR *, const GpInput *, void *);
+typedef int (WINAPI *GpFromHDC_t)(HDC, void **);
+typedef int (WINAPI *GpOne_t)(void *);
+typedef int (WINAPI *GpSmoothing_t)(void *, int);
+typedef int (WINAPI *GpSolidFill_t)(DWORD, void **);
+typedef int (WINAPI *GpPen_t)(DWORD, float, int, void **);
+typedef int (WINAPI *GpEllipse_t)(void *, void *, float, float, float, float);
+typedef int (WINAPI *GpPolygon_t)(void *, void *, const float *, int, int);
+typedef int (WINAPI *GpPath_t)(int, void **);
+typedef int (WINAPI *GpArc_t)(void *, float, float, float, float, float, float);
+typedef int (WINAPI *GpPathOp_t)(void *, void *, void *);
+typedef int (WINAPI *GpFlush_t)(void *, int);
+static struct {
+    int ok;
+    GpFromHDC_t FromHDC;
+    GpOne_t DelGraphics, DelBrush, DelPen, DelPath, ClosePath;
+    GpSmoothing_t Smoothing;
+    GpSolidFill_t SolidFill;
+    GpPen_t Pen;
+    GpEllipse_t FillEllipse, DrawEllipse;
+    GpPolygon_t FillPolygon;
+    GpPath_t Path;
+    GpArc_t Arc;
+    GpPathOp_t FillPath, DrawPath;
+    GpFlush_t Flush;
+} gp;
+static char g_monoFace[32] = "Courier New";
+
+static void load_gdiplus(void)
+{
+    HMODULE h = LoadLibraryA("gdiplus.dll");
+    GpStartup_t start;
+    GpInput in;
+    ULONG_PTR token;
+    if (!h) return;
+    start = (GpStartup_t)GetProcAddress(h, "GdiplusStartup");
+    gp.FromHDC = (GpFromHDC_t)GetProcAddress(h, "GdipCreateFromHDC");
+    gp.DelGraphics = (GpOne_t)GetProcAddress(h, "GdipDeleteGraphics");
+    gp.DelBrush = (GpOne_t)GetProcAddress(h, "GdipDeleteBrush");
+    gp.DelPen = (GpOne_t)GetProcAddress(h, "GdipDeletePen");
+    gp.DelPath = (GpOne_t)GetProcAddress(h, "GdipDeletePath");
+    gp.ClosePath = (GpOne_t)GetProcAddress(h, "GdipClosePathFigure");
+    gp.Smoothing = (GpSmoothing_t)GetProcAddress(h, "GdipSetSmoothingMode");
+    gp.SolidFill = (GpSolidFill_t)GetProcAddress(h, "GdipCreateSolidFill");
+    gp.Pen = (GpPen_t)GetProcAddress(h, "GdipCreatePen1");
+    gp.FillEllipse = (GpEllipse_t)GetProcAddress(h, "GdipFillEllipse");
+    gp.DrawEllipse = (GpEllipse_t)GetProcAddress(h, "GdipDrawEllipse");
+    gp.FillPolygon = (GpPolygon_t)GetProcAddress(h, "GdipFillPolygon");
+    gp.Path = (GpPath_t)GetProcAddress(h, "GdipCreatePath");
+    gp.Arc = (GpArc_t)GetProcAddress(h, "GdipAddPathArc");
+    gp.FillPath = (GpPathOp_t)GetProcAddress(h, "GdipFillPath");
+    gp.DrawPath = (GpPathOp_t)GetProcAddress(h, "GdipDrawPath");
+    gp.Flush = (GpFlush_t)GetProcAddress(h, "GdipFlush");
+    if (!start || !gp.FromHDC || !gp.DelGraphics || !gp.DelBrush || !gp.DelPen || !gp.DelPath ||
+        !gp.ClosePath || !gp.Smoothing || !gp.SolidFill || !gp.Pen || !gp.FillEllipse ||
+        !gp.DrawEllipse || !gp.FillPolygon || !gp.Path || !gp.Arc || !gp.FillPath || !gp.DrawPath || !gp.Flush)
+        return;
+    memset(&in, 0, sizeof in);
+    in.ver = 1;
+    if (start(&token, &in, NULL) == 0) gp.ok = 1;
+}
+
+typedef struct { HDC dc; void *g; } WinDraw;
+static DWORD argb(unsigned c) { return 0xFF000000u | (c & 0xFFFFFF); }
+static COLORREF cref(unsigned c) { return RGB((c >> 16) & 255, (c >> 8) & 255, c & 255); }
+
+static void wd_rect(void *ctx, double x, double y, double w, double h, double r, unsigned fill, unsigned line)
+{
+    WinDraw *d = (WinDraw *)ctx;
+    if (d->g && r > 0.5) {
+        void *path = NULL, *br = NULL, *pen = NULL;
+        float fx = (float)x + 0.5f, fy = (float)y + 0.5f, fw = (float)w - 1, fh = (float)h - 1, rr = (float)r * 2;
+        gp.Path(0, &path);
+        gp.Arc(path, fx, fy, rr, rr, 180, 90);
+        gp.Arc(path, fx + fw - rr, fy, rr, rr, 270, 90);
+        gp.Arc(path, fx + fw - rr, fy + fh - rr, rr, rr, 0, 90);
+        gp.Arc(path, fx, fy + fh - rr, rr, rr, 90, 90);
+        gp.ClosePath(path);
+        if (fill != KV_NONE && gp.SolidFill(argb(fill), &br) == 0) { gp.FillPath(d->g, br, path); gp.DelBrush(br); }
+        if (line != KV_NONE && gp.Pen(argb(line), 1.0f, 2, &pen) == 0) { gp.DrawPath(d->g, pen, path); gp.DelPen(pen); }
+        gp.DelPath(path);
+        return;
+    }
+    {
+        HBRUSH b = fill != KV_NONE ? CreateSolidBrush(cref(fill)) : (HBRUSH)GetStockObject(NULL_BRUSH);
+        HPEN p = line != KV_NONE ? CreatePen(PS_SOLID, 1, cref(line)) : (HPEN)GetStockObject(NULL_PEN);
+        HGDIOBJ ob = SelectObject(d->dc, b), op = SelectObject(d->dc, p);
+        int ix = (int)(x + 0.5), iy = (int)(y + 0.5), ir = (int)(x + w + 0.5) + (line == KV_NONE), ib = (int)(y + h + 0.5) + (line == KV_NONE);
+        if (d->g) gp.Flush(d->g, 0);
+        if (r > 0.5) RoundRect(d->dc, ix, iy, ir, ib, (int)(r * 2), (int)(r * 2));
+        else Rectangle(d->dc, ix, iy, ir, ib);
+        SelectObject(d->dc, ob);
+        SelectObject(d->dc, op);
+        if (fill != KV_NONE) DeleteObject(b);
+        if (line != KV_NONE) DeleteObject(p);
+    }
+}
+
+static void wd_circle(void *ctx, double cx, double cy, double r, unsigned fill, unsigned line, double width)
+{
+    WinDraw *d = (WinDraw *)ctx;
+    if (d->g) {
+        void *br = NULL, *pen = NULL;
+        if (fill != KV_NONE && gp.SolidFill(argb(fill), &br) == 0) {
+            gp.FillEllipse(d->g, br, (float)(cx - r), (float)(cy - r), (float)(2 * r), (float)(2 * r));
+            gp.DelBrush(br);
+        }
+        if (line != KV_NONE && gp.Pen(argb(line), (float)width, 2, &pen) == 0) {
+            gp.DrawEllipse(d->g, pen, (float)(cx - r), (float)(cy - r), (float)(2 * r), (float)(2 * r));
+            gp.DelPen(pen);
+        }
+        return;
+    }
+    {
+        HBRUSH b = fill != KV_NONE ? CreateSolidBrush(cref(fill)) : (HBRUSH)GetStockObject(NULL_BRUSH);
+        HPEN p = line != KV_NONE ? CreatePen(PS_SOLID, width > 1.5 ? 2 : 1, cref(line)) : (HPEN)GetStockObject(NULL_PEN);
+        HGDIOBJ ob = SelectObject(d->dc, b), op = SelectObject(d->dc, p);
+        Ellipse(d->dc, (int)(cx - r + 0.5), (int)(cy - r + 0.5), (int)(cx + r + 0.5), (int)(cy + r + 0.5));
+        SelectObject(d->dc, ob);
+        SelectObject(d->dc, op);
+        if (fill != KV_NONE) DeleteObject(b);
+        if (line != KV_NONE) DeleteObject(p);
+    }
+}
+
+static void wd_poly(void *ctx, const double *xy, int n, unsigned fill)
+{
+    WinDraw *d = (WinDraw *)ctx;
+    int i;
+    if (d->g) {
+        float pts[16];
+        void *br = NULL;
+        for (i = 0; i < n && i < 8; i++) { pts[2 * i] = (float)xy[2 * i]; pts[2 * i + 1] = (float)xy[2 * i + 1]; }
+        if (gp.SolidFill(argb(fill), &br) == 0) { gp.FillPolygon(d->g, br, pts, n, 0); gp.DelBrush(br); }
+        return;
+    }
+    {
+        POINT pt[8];
+        HBRUSH b = CreateSolidBrush(cref(fill));
+        HGDIOBJ ob = SelectObject(d->dc, b), op = SelectObject(d->dc, GetStockObject(NULL_PEN));
+        for (i = 0; i < n && i < 8; i++) { pt[i].x = (LONG)(xy[2 * i] + 0.5); pt[i].y = (LONG)(xy[2 * i + 1] + 0.5); }
+        Polygon(d->dc, pt, n < 8 ? n : 8);
+        SelectObject(d->dc, ob);
+        SelectObject(d->dc, op);
+        DeleteObject(b);
+    }
+}
+
+static HFONT view_font(double size, int flags)
+{
+    static struct { int key; HFONT f; } cache[32];
+    static int n;
+    int px = (int)(size + 0.5), i, key;
+    if (px < 6) px = 6;
+    key = px | ((flags & KV_BOLD) ? 0x10000 : 0) | ((flags & KV_MONO) ? 0x20000 : 0);
+    for (i = 0; i < n; i++) if (cache[i].key == key) return cache[i].f;
+    if (n == 32) { for (i = 0; i < n; i++) DeleteObject(cache[i].f); n = 0; }
+    cache[n].key = key;
+    cache[n].f = CreateFontA(-px, 0, 0, 0, (flags & KV_BOLD) ? FW_BOLD : FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
+                             OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                             (flags & KV_MONO) ? (FIXED_PITCH | FF_MODERN) : (VARIABLE_PITCH | FF_SWISS),
+                             (flags & KV_MONO) ? g_monoFace : "Segoe UI");
+    return cache[n++].f;
+}
+
+static void wd_text(void *ctx, double x, double y, const char *s, double size, int flags, unsigned color)
+{
+    WinDraw *d = (WinDraw *)ctx;
+    HGDIOBJ of;
+    int n = (int)strlen(s);
+    if (d->g) gp.Flush(d->g, 0);
+    of = SelectObject(d->dc, view_font(size, flags));
+    SetBkMode(d->dc, TRANSPARENT);
+    SetTextColor(d->dc, cref(color));
+    if (flags & (KV_CENTER | KV_RIGHT)) {
+        SIZE sz;
+        GetTextExtentPoint32A(d->dc, s, n, &sz);
+        x -= (flags & KV_CENTER) ? sz.cx / 2.0 : sz.cx;
+    }
+    TextOutA(d->dc, (int)(x + 0.5), (int)(y + 0.5), s, n);
+    SelectObject(d->dc, of);
+}
+
+static LRESULT CALLBACK simview_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
+{
+    if (msg == WM_ERASEBKGND) return 1;
+    if (msg == WM_PAINT) {
+        PAINTSTRUCT ps;
+        RECT rc;
+        HDC dc = BeginPaint(h, &ps), mem;
+        HBITMAP bmp;
+        HGDIOBJ old;
+        WinDraw d;
+        KitDraw kd;
+        GetClientRect(h, &rc);
+        if (rc.right > 0 && rc.bottom > 0) {
+            mem = CreateCompatibleDC(dc);
+            bmp = CreateCompatibleBitmap(dc, rc.right, rc.bottom);
+            old = SelectObject(mem, bmp);
+            d.dc = mem;
+            d.g = NULL;
+            if (gp.ok && gp.FromHDC(mem, &d.g) == 0) gp.Smoothing(d.g, 4);   /* anti-aliased */
+            else d.g = NULL;
+            kd.ctx = &d;
+            kd.rect = wd_rect;
+            kd.circle = wd_circle;
+            kd.poly = wd_poly;
+            kd.text = wd_text;
+            kitview_draw(&kd, rc.right, rc.bottom, &g_sim.panel);
+            if (d.g) { gp.Flush(d.g, 0); gp.DelGraphics(d.g); }
+            BitBlt(dc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
+            SelectObject(mem, old);
+            DeleteObject(bmp);
+            DeleteDC(mem);
+        }
+        EndPaint(h, &ps);
+        return 0;
+    }
+    return DefWindowProcA(h, msg, wp, lp);
+}
+
+static char *assemble_ex(int quiet_dump, KitUiProgram *prog);
+
+/* refresh the panel; when the program does not run, select the next line in the editor */
+static void sim_show(void)
+{
+    kitsim_update(&g_sim);
+    InvalidateRect(g_simView, NULL, FALSE);
+    EnableWindow(g_btnSimPause, g_sim.panel.running);
+    if (!g_sim.panel.running && g_sim.panel.line > 0) {
+        int start = (int)SendMessageA(g_edit, EM_LINEINDEX, g_sim.panel.line - 1, 0);
+        if (start >= 0) {
+            int len = (int)SendMessageA(g_edit, EM_LINELENGTH, start, 0);
+            SendMessageA(g_edit, EM_SETSEL, start, start + len);
+            SendMessageA(g_edit, EM_SCROLLCARET, 0, 0);
+        }
+    }
+}
+
+/* the editor's program in the simulator: assembled again only when the text changed */
+static int sim_prepare(int *fresh)
+{
+    char *text = editor_text(), *abs;
+    KitUiProgram prog;
+    *fresh = 0;
+    if (text && kitsim_same_source(&g_sim, text)) { free(text); return 1; }
+    free(text);
+    memset(&prog, 0, sizeof prog);
+    abs = assemble_ex(1, &prog);
+    if (!abs) { kitui_free_program(&prog); return 0; }
+    free(abs);
+    text = editor_text();
+    kitsim_load(&g_sim, &prog, text ? text : "");
+    free(text);
+    outf(KO_INFO, "Simulator: program loaded (%d bytes at 0000:1000).", g_sim.prog.len);
+    *fresh = 1;
+    return 1;
+}
+
+static void sim_run(void)
+{
+    int fresh;
+    if (!sim_prepare(&fresh)) return;
+    if (g_sim.panel.v.stop >= 0) kitsim_reset(&g_sim);     /* it had stopped: start again */
+    g_sim.panel.running = 1;
+    g_simTick = GetTickCount();
+    SetTimer(g_main, 2, 30, NULL);
+    sim_show();
+}
+
+static void sim_step(void)
+{
+    int fresh;
+    if (!sim_prepare(&fresh)) return;
+    KillTimer(g_main, 2);
+    g_sim.panel.running = 0;
+    if (!fresh) {                       /* just loaded: first show where it starts */
+        if (g_sim.panel.v.stop >= 0) kitsim_reset(&g_sim);
+        else kitsim_step(&g_sim);
+    }
+    sim_show();
+}
+
+static void sim_pause(void)
+{
+    if (!g_sim.panel.running) return;
+    g_sim.panel.running = 0;
+    KillTimer(g_main, 2);
+    sim_show();
+}
+
+static void sim_reset(void)
+{
+    KillTimer(g_main, 2);
+    kitsim_reset(&g_sim);
+    sim_show();
+}
+
+static void sim_speed_changed(void)
+{
+    char buf[40];
+    g_speedIdx = (int)SendMessageA(g_speed, TBM_GETPOS, 0, 0);
+    if (g_speedIdx < 0) g_speedIdx = 0;
+    if (g_speedIdx > 6) g_speedIdx = 6;
+    g_sim.panel.speed = SPEEDS[g_speedIdx];
+    if (g_speedIdx == 6) snprintf(buf, sizeof buf, "Speed 1x");
+    else snprintf(buf, sizeof buf, "Speed 1/%.0fx", 1.0 / SPEEDS[g_speedIdx]);
+    SetWindowTextA(g_speedLbl, buf);
+    InvalidateRect(g_simView, NULL, FALSE);
+}
+
+static void sim_float(int on);
+
+static void sim_panel_toggle(void)
+{
+    int sw;
+    if (g_simFloat) sim_float(0);       /* back in the main window first */
+    g_simShown = !g_simShown;
+    sw = g_simShown ? SW_SHOW : SW_HIDE;
+    ShowWindow(g_simView, sw);
+    ShowWindow(g_btnSimRun, sw);
+    ShowWindow(g_btnSimStep, sw);
+    ShowWindow(g_btnSimPause, sw);
+    ShowWindow(g_btnSimReset, sw);
+    ShowWindow(g_speed, sw);
+    ShowWindow(g_speedLbl, sw);
+    CheckMenuItem(GetMenu(g_main), IDM_SIMPANEL, g_simShown ? MF_CHECKED : MF_UNCHECKED);
+    layout();
+    InvalidateRect(g_main, NULL, TRUE);
+}
+
+/* the simulator's buttons in a row at (simX, y), the picture below them down to 'bottom' */
+static void sim_layout(int simX, int y, int simW, int bottom)
+{
+    int m = S(6), bh = S(26), x = simX;
+    MoveWindow(g_btnSimRun, x, y, S(64), bh, TRUE); x += S(64) + S(4);
+    MoveWindow(g_btnSimStep, x, y, S(64), bh, TRUE); x += S(64) + S(4);
+    MoveWindow(g_btnSimPause, x, y, S(70), bh, TRUE); x += S(70) + S(4);
+    MoveWindow(g_btnSimReset, x, y, S(52), bh, TRUE); x += S(52) + S(8);
+    {
+        int lw = S(86), tw = simX + simW - x - lw;
+        if (tw < S(70)) tw = S(70);
+        MoveWindow(g_speed, x, y, tw, bh, TRUE);
+        MoveWindow(g_speedLbl, x + tw + S(2), y + S(5), lw - S(2), bh - S(5), TRUE);
+    }
+    MoveWindow(g_simView, simX, y + bh + m, simW, bottom - (y + bh + m), TRUE);
+}
+
+/* the separate simulator window: its buttons talk to the main window */
+static LRESULT CALLBACK simwin_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg) {
+    case WM_SIZE:
+        if (g_simFloat) {
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            sim_layout(S(6), S(6), rc.right - S(12), rc.bottom - S(6));
+        }
+        return 0;
+    case WM_GETMINMAXINFO: {
+        MINMAXINFO *mm = (MINMAXINFO *)lp;
+        mm->ptMinTrackSize.x = S(420);
+        mm->ptMinTrackSize.y = S(360);
+        return 0;
+    }
+    case WM_COMMAND:
+    case WM_HSCROLL:
+        return SendMessageA(g_main, msg, wp, lp);
+    case WM_CLOSE:
+        sim_float(0);                   /* closing it puts the simulator back into the main window */
+        return 0;
+    }
+    return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
+static void sim_float(int on)
+{
+    HWND kids[7];
+    int i;
+    if (on == g_simFloat) return;
+    kids[0] = g_btnSimRun; kids[1] = g_btnSimStep; kids[2] = g_btnSimPause; kids[3] = g_btnSimReset;
+    kids[4] = g_speed; kids[5] = g_speedLbl; kids[6] = g_simView;
+    if (on) {
+        RECT wa, rc;
+        int w = S(600), h = S(720);
+        if (!g_simShown) sim_panel_toggle();
+        if (!SystemParametersInfoA(SPI_GETWORKAREA, 0, &wa, 0)) { wa.left = wa.top = 0; wa.right = 1024; wa.bottom = 740; }
+        if (w > wa.right - wa.left) w = wa.right - wa.left;
+        if (h > wa.bottom - wa.top) h = wa.bottom - wa.top;
+        /* owned by the main window: it stays above the editor, like emu8086's emulator window */
+        g_simWin = CreateWindowExA(0, "KitSimWin", "Simulator - " APP_NAME, WS_OVERLAPPEDWINDOW,
+                                   wa.right - w, wa.top, w, h, g_main, NULL, g_inst, NULL);
+        if (!g_simWin) return;
+        for (i = 0; i < 7; i++) SetParent(kids[i], g_simWin);
+        g_simFloat = 1;
+        GetClientRect(g_simWin, &rc);
+        sim_layout(S(6), S(6), rc.right - S(12), rc.bottom - S(6));
+        ShowWindow(g_simWin, SW_SHOWNOACTIVATE);
+    } else {
+        g_simFloat = 0;
+        for (i = 0; i < 7; i++) SetParent(kids[i], g_main);
+        if (g_simWin) DestroyWindow(g_simWin);
+        g_simWin = NULL;
+    }
+    CheckMenuItem(GetMenu(g_main), IDM_SIMFLOAT, g_simFloat ? MF_CHECKED : MF_UNCHECKED);
+    layout();
+    InvalidateRect(g_main, NULL, TRUE);
+}
+
 /* ------------------------------------------------------------------ layout */
 static void layout(void)
 {
     RECT rc, sr;
-    int m = S(6), bh = S(26), x, y, w, h, sh, outH, cmdH = S(24), top;
+    int m = S(6), bh = S(26), x, y, w, h, sh, outH, cmdH = S(24), top, simW = 0, simX;
     GetClientRect(g_main, &rc);
     SendMessageA(g_status, WM_SIZE, 0, 0);
     GetWindowRect(g_status, &sr);
@@ -627,22 +1052,34 @@ static void layout(void)
         SendMessageA(g_status, SB_SETTEXTA, 2, (LPARAM)g_sbKit);
         g_lastLine = -1;
     }
+    if (g_simShown && !g_simFloat) {    /* the simulator takes the right part of the window */
+        simW = (rc.right - 3 * m) * 45 / 100;
+        if (simW > rc.right - 3 * m - S(560)) simW = rc.right - 3 * m - S(560);   /* editor side first */
+        if (simW < S(360)) simW = S(360);
+    }
+    w = rc.right - 2 * m - (simW ? simW + m : 0);
     x = m; y = m;
-    MoveWindow(g_btnAsm, x, y, S(110), bh, TRUE); x += S(110) + m;
-    MoveWindow(g_btnRun, x, y, S(130), bh, TRUE); x += S(130) + m;
-    MoveWindow(g_btnStop, x, y, S(60), bh, TRUE); x += S(60) + S(18);
-    MoveWindow(g_portLbl, x, y + S(5), S(32), bh - S(5), TRUE); x += S(34);
-    MoveWindow(g_port, x, y + S(1), S(140), S(200), TRUE); x += S(140) + m;
-    MoveWindow(g_btnRefresh, x, y, S(70), bh, TRUE);
+    {   /* narrow editor side: smaller buttons, so nothing runs into the simulator's buttons */
+        int c = w < S(600);
+        MoveWindow(g_btnAsm, x, y, c ? S(100) : S(110), bh, TRUE); x += (c ? S(100) : S(110)) + m;
+        MoveWindow(g_btnRun, x, y, c ? S(112) : S(130), bh, TRUE); x += (c ? S(112) : S(130)) + m;
+        MoveWindow(g_btnStop, x, y, c ? S(48) : S(60), bh, TRUE); x += (c ? S(48) : S(60)) + (c ? S(10) : S(18));
+        MoveWindow(g_portLbl, x, y + S(5), S(32), bh - S(5), TRUE); x += S(34);
+        MoveWindow(g_port, x, y + S(1), c ? S(118) : S(140), S(200), TRUE); x += (c ? S(118) : S(140)) + m;
+        MoveWindow(g_btnRefresh, x, y, c ? S(62) : S(70), bh, TRUE);
+    }
     top = y + bh + m;
     h = rc.bottom - sh - top;
     outH = h * 34 / 100;
     if (outH < S(90)) outH = S(90);
-    w = rc.right - 2 * m;
     MoveWindow(g_edit, m, top, w, h - outH - cmdH - 2 * m, TRUE);
     MoveWindow(g_out, m, top + h - outH - cmdH - m, w, outH, TRUE);
     MoveWindow(g_cmd, m, top + h - cmdH - m / 2, w - S(90) - m, cmdH, TRUE);
     MoveWindow(g_btnSend, m + w - S(90), top + h - cmdH - m / 2, S(90), cmdH, TRUE);
+    if (simW) {
+        simX = m + w + m;
+        sim_layout(simX, y, simW, rc.bottom - sh - m / 2);
+    }
 }
 
 static void update_line_col(void)
@@ -696,6 +1133,7 @@ static HFONT make_mono_font(int pt)
     lf.lfPitchAndFamily = FIXED_PITCH | FF_MODERN;
     lf.lfQuality = CLEARTYPE_QUALITY;
     strcpy(lf.lfFaceName, found ? "Consolas" : "Courier New");
+    snprintf(g_monoFace, sizeof g_monoFace, "%s", lf.lfFaceName);
     return CreateFontIndirectA(&lf);
 }
 
@@ -736,6 +1174,15 @@ static HMENU make_menu(void)
     AppendMenuA(m, MF_STRING, IDM_FIND, "&Find kit (connect)");
     AppendMenuA(m, MF_STRING, IDM_CLEAR, "&Clear output");
     AppendMenuA(bar, MF_POPUP, (UINT_PTR)m, "&Kit");
+    m = CreatePopupMenu();
+    AppendMenuA(m, MF_STRING, IDM_SIMRUN, "&Run in simulator\tF6");
+    AppendMenuA(m, MF_STRING, IDM_SIMSTEP, "&Step (one instruction)\tF8");
+    AppendMenuA(m, MF_STRING, IDM_SIMPAUSE, "&Pause\tF9");
+    AppendMenuA(m, MF_STRING, IDM_SIMRESET, "R&eset");
+    AppendMenuA(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(m, MF_STRING | (g_simShown ? MF_CHECKED : 0), IDM_SIMPANEL, "Show simulator &panel");
+    AppendMenuA(m, MF_STRING, IDM_SIMFLOAT, "Separate &window");
+    AppendMenuA(bar, MF_POPUP, (UINT_PTR)m, "&Simulator");
     m = CreatePopupMenu();                /* built into the program: no folder needed */
     for (i = 0; i < kit_nexamples; i++)
         AppendMenuA(m, MF_STRING, IDM_EX_FIRST + i, kit_examples[i].menu);
@@ -807,6 +1254,21 @@ static void create_children(HWND hwnd)
     g_cmdOldProc = (WNDPROC)SetWindowLongPtrA(g_cmd, GWLP_WNDPROC, (LONG_PTR)cmd_proc);
     g_btnSend = make_button("Send to kit", IDC_SEND);
 
+    g_btnSimRun = make_button("Run F6", IDC_SIMRUN);
+    g_btnSimStep = make_button("Step F8", IDC_SIMSTEP);
+    g_btnSimPause = make_button("Pause F9", IDC_SIMPAUSE);
+    g_btnSimReset = make_button("Reset", IDC_SIMRESET);
+    EnableWindow(g_btnSimPause, FALSE);
+    g_speed = CreateWindowExA(0, TRACKBAR_CLASSA, "", WS_CHILD | WS_VISIBLE | WS_TABSTOP | TBS_HORZ | TBS_AUTOTICKS,
+                              0, 0, 10, 10, hwnd, (HMENU)IDC_SPEED, g_inst, NULL);
+    SendMessageA(g_speed, TBM_SETRANGE, TRUE, MAKELPARAM(0, 6));
+    SendMessageA(g_speed, TBM_SETPOS, TRUE, g_speedIdx);
+    g_speedLbl = CreateWindowExA(0, "STATIC", "Speed 1x", WS_CHILD | WS_VISIBLE, 0, 0, 10, 10, hwnd,
+                                 (HMENU)IDC_SPEEDLBL, g_inst, NULL);
+    SendMessageA(g_speedLbl, WM_SETFONT, (WPARAM)g_fontUI, FALSE);
+    g_simView = CreateWindowExA(0, "KitSimView", "", WS_CHILD | WS_VISIBLE, 0, 0, 10, 10, hwnd,
+                                (HMENU)IDC_SIMVIEW, g_inst, NULL);
+
     g_status = CreateWindowExA(0, STATUSCLASSNAMEA, "", WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP,
                                0, 0, 0, 0, hwnd, (HMENU)IDC_STATUS, g_inst, NULL);
     SendMessageA(g_status, WM_SETFONT, (WPARAM)g_fontUI, FALSE);
@@ -829,13 +1291,25 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_GETMINMAXINFO: {
         MINMAXINFO *mm = (MINMAXINFO *)lp;
-        mm->ptMinTrackSize.x = S(560);
-        mm->ptMinTrackSize.y = S(400);
+        mm->ptMinTrackSize.x = S(640);
+        mm->ptMinTrackSize.y = S(480);
         return 0;
     }
 
     case WM_TIMER:
+        if (wp == 2) {                  /* simulator running */
+            DWORD now = GetTickCount();
+            kitsim_tick(&g_sim, (now - g_simTick) / 1000.0);
+            g_simTick = now;
+            if (!g_sim.panel.running) KillTimer(hwnd, 2);
+            sim_show();
+            return 0;
+        }
         update_line_col();
+        return 0;
+
+    case WM_HSCROLL:
+        if ((HWND)lp == g_speed) sim_speed_changed();
         return 0;
 
     case WM_KITTEXT:
@@ -930,6 +1404,12 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             return 0;
         case IDM_FIND: start_job(JOB_FIND, NULL, 0); return 0;
         case IDM_CLEAR: SetWindowTextA(g_out, ""); g_outAtLineStart = 1; return 0;
+        case IDC_SIMRUN: case IDM_SIMRUN: sim_run(); return 0;
+        case IDC_SIMSTEP: case IDM_SIMSTEP: sim_step(); return 0;
+        case IDC_SIMPAUSE: case IDM_SIMPAUSE: sim_pause(); return 0;
+        case IDC_SIMRESET: case IDM_SIMRESET: sim_reset(); return 0;
+        case IDM_SIMPANEL: sim_panel_toggle(); return 0;
+        case IDM_SIMFLOAT: sim_float(!g_simFloat); return 0;
         case IDC_SEND: {
             char line[200];
             GetWindowTextA(g_cmd, line, sizeof line);
@@ -973,6 +1453,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_DESTROY:
         KillTimer(hwnd, 1);
+        KillTimer(hwnd, 2);
         InterlockedExchange(&g_cancel, 1);
         InterlockedExchange(&g_quit, 1);
         SetEvent(g_wake);
@@ -993,6 +1474,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
         { FVIRTKEY | FCONTROL, 'S', IDM_SAVE }, { FVIRTKEY | FCONTROL, 'A', IDM_SELALL },
         { FVIRTKEY, VK_F5, IDM_RUN }, { FVIRTKEY, VK_F7, IDM_ASM },
         { FVIRTKEY, VK_ESCAPE, IDM_STOP }, { FVIRTKEY, VK_F1, IDM_HELP },
+        { FVIRTKEY, VK_F6, IDM_SIMRUN }, { FVIRTKEY, VK_F8, IDM_SIMSTEP }, { FVIRTKEY, VK_F9, IDM_SIMPAUSE },
     };
     HDC dc;
     DWORD n;
@@ -1028,9 +1510,32 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
     wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     wc.lpszClassName = "KitStudioMain";
     RegisterClassExA(&wc);
+    wc.lpfnWndProc = simview_proc;              /* the Simulator panel's picture */
+    wc.hIcon = NULL;
+    wc.hIconSm = NULL;
+    wc.hbrBackground = NULL;
+    wc.lpszClassName = "KitSimView";
+    RegisterClassExA(&wc);
+    wc.lpfnWndProc = simwin_proc;               /* Simulator > Separate window */
+    wc.hIcon = LoadIconA(inst, MAKEINTRESOURCEA(IDI_APP));
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.lpszClassName = "KitSimWin";
+    RegisterClassExA(&wc);
+    load_gdiplus();
+    kitsim_unload(&g_sim);
+    g_sim.panel.speed = 1.0;
 
-    g_main = CreateWindowExA(0, wc.lpszClassName, APP_NAME, WS_OVERLAPPEDWINDOW,
-                             CW_USEDEFAULT, CW_USEDEFAULT, S(940), S(680), NULL, make_menu(), inst, NULL);
+    {   /* editor and simulator side by side: as wide as the screen allows */
+        RECT wa;
+        int ww = S(1320), wh = S(800);
+        if (!SystemParametersInfoA(SPI_GETWORKAREA, 0, &wa, 0)) { wa.left = wa.top = 0; wa.right = 1024; wa.bottom = 740; }
+        if (ww > wa.right - wa.left) ww = wa.right - wa.left;
+        if (wh > wa.bottom - wa.top) wh = wa.bottom - wa.top;
+        g_narrow = wa.right - wa.left < S(1200);
+        g_main = CreateWindowExA(0, "KitStudioMain", APP_NAME, WS_OVERLAPPEDWINDOW,
+                                 wa.left + (wa.right - wa.left - ww) / 2, wa.top + (wa.bottom - wa.top - wh) / 2,
+                                 ww, wh, NULL, make_menu(), inst, NULL);
+    }
     if (!g_main) return 1;
     g_accel = CreateAcceleratorTableA(acc, sizeof acc / sizeof acc[0]);
 
@@ -1045,6 +1550,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
 
     ShowWindow(g_main, show);
     UpdateWindow(g_main);
+    if (g_narrow) sim_float(1);         /* small screen: the simulator in its own window */
     SetFocus(g_edit);
 
     while (GetMessageA(&msg, NULL, 0, 0) > 0) {

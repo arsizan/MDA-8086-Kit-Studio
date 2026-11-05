@@ -11,7 +11,7 @@
 #        package: I386_GLIBCONFIG_DIR=<folder with glibconfig.h> sh build_linux.sh
 set -e
 cd "$(dirname "$0")"
-MODULES="kitasm kitcore kitport_posix kitsim kithint kitui kitbuiltin main_gtk"
+MODULES="kitasm kitcore kitport_posix kitsim kithint kitui kitbuiltin kitview main_gtk"
 GTKVER="-DGDK_VERSION_MIN_REQUIRED=GDK_VERSION_3_10 -DGDK_VERSION_MAX_ALLOWED=GDK_VERSION_3_10"
 GTKVER="$GTKVER -DGLIB_VERSION_MIN_REQUIRED=GLIB_VERSION_2_40 -DGLIB_VERSION_MAX_ALLOWED=GLIB_VERSION_2_40"
 JWFLAGS="-O2 -w -D__UNIX__ -DNDEBUG -Dexit=jw_exit -Ijwasm/H"
@@ -44,7 +44,7 @@ ZIG=${ZIG:-"python3 -m ziglang"}
 GTK_NOSYS=$(echo "$GTK_CFLAGS" | tr ' ' '\n' |
             grep -v -e '^-I/usr/include/x86_64-linux-gnu$' -e 'dbus-1.0' -e '^-pthread$' | tr '\n' ' ')
 LIBS="gtk-3 gdk-3 gdk_pixbuf-2.0 pango-1.0 gio-2.0 gobject-2.0 glib-2.0"
-libpaths() { for l in $LIBS; do printf '%s ' "$1/lib$l.so.0"; done; }
+libpaths() { for l in $LIBS; do printf '%s ' "$1/lib$l.so.0"; done; printf '%s ' "$1/libcairo.so.2"; }
 
 # 64-bit PCs
 build kitstudio-x86_64 "$ZIG cc -target x86_64-linux-gnu.2.17" "-mcpu=x86_64 -fno-sanitize=undefined" \

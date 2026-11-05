@@ -70,6 +70,13 @@ typedef struct {
     unsigned long long seg_since;
 
     KitSimReport *rep;
+
+    /* live view for the simulator panel (only when live = 1) */
+    int live, lv_stepped;
+    unsigned long long lv_last, lv_frame;          /* last accounted cycle, start of the picture */
+    unsigned long long lv_g[64], lv_r[64], lv_seg[8], lv_led[4];   /* cycles lit */
+    unsigned char lcd_ram[2][40];
+    int lcd_line, lcd_col, lcd_shift, lcd_on;
 } Sim;
 
 static unsigned char parity[256];
@@ -377,11 +384,63 @@ static void ppi_write(Ppi *p, int idx, unsigned v)
     }
 }
 
+/* live view: add the time since the last change to every LED that was lit */
+static void live_add(Sim *c, unsigned long long t)
+{
+    unsigned long long dt;
+    unsigned red, green, col, seg, leds;
+    int x, y;
+    if (!c->live) return;
+    if (t <= c->lv_last) { c->lv_last = t; return; }
+    dt = t - c->lv_last;
+    c->lv_last = t;
+    dm_driven(c, &red, &green, &col);
+    for (x = 0; x < 8; x++) {
+        if (!((col >> x) & 1)) continue;
+        for (y = 0; y < 8; y++) {
+            if (!((green >> (7 - y)) & 1)) c->lv_g[y * 8 + x] += dt;
+            if (!((red >> (7 - y)) & 1)) c->lv_r[y * 8 + x] += dt;
+        }
+    }
+    seg = (!c->p2.set || c->p2.in_a) ? 0xFF : c->p2.latch[0];      /* 0 = segment on */
+    for (x = 0; x < 8; x++) if (!((seg >> x) & 1)) c->lv_seg[x] += dt;
+    leds = (!c->p2.set || c->p2.in_b) ? 0 : c->p2.latch[1];        /* 1 = LED on */
+    for (x = 0; x < 4; x++) if ((leds >> x) & 1) c->lv_led[x] += dt;
+}
+
+/* 16x2 LCD: 00H instruction, 04H data (HD44780 commands the kit's programs use) */
+static void lcd_write(Sim *c, int data, unsigned v)
+{
+    if (data) {
+        c->lcd_ram[c->lcd_line][c->lcd_col] = (unsigned char)v;
+        if (c->lcd_col < 39) c->lcd_col++;
+        return;
+    }
+    if (v == 0x01) {                                       /* clear */
+        memset(c->lcd_ram, ' ', sizeof c->lcd_ram);
+        c->lcd_line = c->lcd_col = c->lcd_shift = 0;
+    } else if ((v & 0xFE) == 0x02) {                       /* home */
+        c->lcd_line = c->lcd_col = c->lcd_shift = 0;
+    } else if ((v & 0xF8) == 0x08) {                       /* display on / off */
+        c->lcd_on = (v & 0x04) != 0;
+    } else if ((v & 0xF0) == 0x10) {                       /* shift display or move cursor */
+        if (v & 0x08) c->lcd_shift = (v & 0x04) ? (c->lcd_shift + 39) % 40 : (c->lcd_shift + 1) % 40;
+        else if (v & 0x04) { if (c->lcd_col < 39) c->lcd_col++; }
+        else if (c->lcd_col > 0) c->lcd_col--;
+    } else if (v & 0x80) {                                 /* DDRAM address: 80H line 1, C0H line 2 */
+        unsigned a = v & 0x7F;
+        c->lcd_line = a >= 0x40;
+        c->lcd_col = (int)(a & 0x3F) > 39 ? 39 : (int)(a & 0x3F);
+    }
+}
+
 static void port_out(Sim *c, unsigned port, unsigned v)
 {
     KitSimReport *r = c->rep;
     port &= 0xFFFF;
     v &= 0xFF;
+    if (c->live && port >= 0x18 && port <= 0x1F) live_add(c, c->cyc);
+    if (c->live && (port == 0x00 || port == 0x04)) lcd_write(c, port == 0x04, v);
     if (port >= 0x18 && port <= 0x1F) {
         int idx = (port - 0x18) >> 1;       /* 0 A, 1 B, 2 C, 3 control */
         if (!(port & 1)) {                  /* CS1: dot matrix */
@@ -1112,6 +1171,156 @@ void kit_simulate(const unsigned char *code, int len, unsigned base, double seco
     make_frames(c);
     free(c->m);
     free(c);
+}
+
+/* ------------------------------------------------------------------ simulator panel */
+struct KitMachine {
+    Sim c;
+    KitSimReport rep;
+    unsigned char *code;
+    int len;
+    unsigned base;
+    unsigned char bg[64], br[64], bs[8], bl[4];    /* the picture shown last */
+};
+
+static void km_load(KitMachine *k)
+{
+    Sim *c = &k->c;
+    unsigned char *mem = c->m;
+    memset(c, 0, sizeof *c);
+    memset(&k->rep, 0, sizeof k->rep);
+    memset(mem, 0, 0x100000);
+    memcpy(mem + k->base, k->code, k->len);
+    memset(mem + 0xF0000, 0xFF, 0x10000);
+    c->m = mem;
+    c->rep = &k->rep;
+    c->lo = k->base;
+    c->hi = k->base + (unsigned)k->len;
+    c->stop = -1;
+    c->ip = (unsigned short)k->base;
+    c->r[R_SP] = 0x0540;
+    c->fl = 0x0002;
+    c->win_len = (unsigned long long)(WIN_SEC * SIM_CLOCK);
+    c->live = 1;
+    c->lcd_on = 1;
+    memset(c->lcd_ram, ' ', sizeof c->lcd_ram);
+    memset(k->bg, 0, sizeof k->bg); memset(k->br, 0, sizeof k->br);
+    memset(k->bs, 0, sizeof k->bs); memset(k->bl, 0, sizeof k->bl);
+}
+
+KitMachine *km_new(const unsigned char *code, int len, unsigned base)
+{
+    KitMachine *k = (KitMachine *)calloc(1, sizeof *k);
+    init_tables();
+    if (!k) return NULL;
+    if (len < 0) len = 0;
+    if ((unsigned)len > 0xF0000 - base) len = (int)(0xF0000 - base);
+    k->c.m = (unsigned char *)malloc(0x100000);
+    k->code = (unsigned char *)malloc(len ? len : 1);
+    if (!k->c.m || !k->code) { free(k->c.m); free(k->code); free(k); return NULL; }
+    memcpy(k->code, code, len);
+    k->len = len;
+    k->base = base;
+    km_load(k);
+    return k;
+}
+
+void km_free(KitMachine *k)
+{
+    if (!k) return;
+    free(k->c.m);
+    free(k->code);
+    free(k);
+}
+
+void km_reset(KitMachine *k) { if (k) km_load(k); }
+
+int km_run(KitMachine *k, unsigned long long cycles)
+{
+    Sim *c = &k->c;
+    unsigned long long end = c->cyc + cycles;
+    while (c->stop < 0 && c->cyc < end) step(c);
+    return c->stop;
+}
+
+int km_step(KitMachine *k)
+{
+    Sim *c = &k->c;
+    if (c->stop < 0) step(c);
+    c->lv_stepped = 1;
+    return c->stop;
+}
+
+static unsigned char km_bright(unsigned long long on, unsigned long long frame, double gain)
+{
+    double d = (double)on / (double)frame * gain;
+    if (d > 1.0) d = 1.0;
+    return (unsigned char)(d * 255.0 + 0.5);
+}
+
+void km_view(KitMachine *k, KitView *v)
+{
+    Sim *c = &k->c;
+    unsigned long long frame;
+    int i;
+    live_add(c, c->cyc);
+    frame = c->cyc - c->lv_frame;
+    if (frame >= 2000 && !c->lv_stepped) {
+        /* running: how long each LED was lit in this picture (a scanned column is lit 1/8
+           of the time, so 1/8 counts as full brightness, as the eye sees it) */
+        for (i = 0; i < 64; i++) {
+            k->bg[i] = km_bright(c->lv_g[i], frame, 8.0);
+            k->br[i] = km_bright(c->lv_r[i], frame, 8.0);
+        }
+        for (i = 0; i < 8; i++) k->bs[i] = km_bright(c->lv_seg[i], frame, 2.0);
+        for (i = 0; i < 4; i++) k->bl[i] = km_bright(c->lv_led[i], frame, 2.0);
+    } else if (c->lv_stepped || frame > 0) {
+        /* single steps / very slow: the outputs exactly as they are now */
+        unsigned red, green, col, seg, leds;
+        int x, y;
+        dm_driven(c, &red, &green, &col);
+        for (y = 0; y < 8; y++)
+            for (x = 0; x < 8; x++) {
+                int on = (col >> x) & 1;
+                k->bg[y * 8 + x] = (on && !((green >> (7 - y)) & 1)) ? 255 : 0;
+                k->br[y * 8 + x] = (on && !((red >> (7 - y)) & 1)) ? 255 : 0;
+            }
+        seg = (!c->p2.set || c->p2.in_a) ? 0xFF : c->p2.latch[0];
+        for (i = 0; i < 8; i++) k->bs[i] = ((seg >> i) & 1) ? 0 : 255;
+        leds = (!c->p2.set || c->p2.in_b) ? 0 : c->p2.latch[1];
+        for (i = 0; i < 4; i++) k->bl[i] = ((leds >> i) & 1) ? 255 : 0;
+    }                                       /* else: nothing ran: keep the last picture */
+    memset(c->lv_g, 0, sizeof c->lv_g);
+    memset(c->lv_r, 0, sizeof c->lv_r);
+    memset(c->lv_seg, 0, sizeof c->lv_seg);
+    memset(c->lv_led, 0, sizeof c->lv_led);
+    c->lv_frame = c->cyc;
+    c->lv_stepped = 0;
+
+    memset(v, 0, sizeof *v);
+    v->ax = c->r[R_AX]; v->bx = c->r[R_BX]; v->cx = c->r[R_CX]; v->dx = c->r[R_DX];
+    v->si = c->r[R_SI]; v->di = c->r[R_DI]; v->bp = c->r[R_BP]; v->sp = c->r[R_SP];
+    v->cs = c->s[S_CS]; v->ds = c->s[S_DS]; v->es = c->s[S_ES]; v->ss = c->s[S_SS];
+    v->ip = c->ip; v->flags = c->fl;
+    v->cycles = c->cyc;
+    v->insns = c->insns;
+    v->stop = c->stop;
+    v->stop_int = k->rep.stop_int;
+    v->stop_op = k->rep.stop_op;
+    for (i = 0; i < 3; i++) { v->p1[i] = c->p1.latch[i]; v->p2[i] = c->p2.latch[i]; }
+    v->p1_set = c->p1.set; v->p2_set = c->p2.set;
+    v->p1cr = (unsigned char)(c->p1.set ? 0x80 | (c->p1.in_a << 4) | (c->p1.in_cu << 3) | (c->p1.in_b << 1) | c->p1.in_cl : 0);
+    v->p2cr = (unsigned char)(c->p2.set ? 0x80 | (c->p2.in_a << 4) | (c->p2.in_cu << 3) | (c->p2.in_b << 1) | c->p2.in_cl : 0);
+    memcpy(v->dm_green, k->bg, 64);
+    memcpy(v->dm_red, k->br, 64);
+    memcpy(v->seg, k->bs, 8);
+    memcpy(v->led, k->bl, 4);
+    v->lcd_on = c->lcd_on;
+    for (i = 0; i < 16; i++) {
+        unsigned char a = c->lcd_ram[0][(c->lcd_shift + i) % 40], b = c->lcd_ram[1][(c->lcd_shift + i) % 40];
+        v->lcd[0][i] = (char)(a >= 32 && a < 127 ? a : ' ');
+        v->lcd[1][i] = (char)(b >= 32 && b < 127 ? b : ' ');
+    }
 }
 
 /* ------------------------------------------------------------------ text */

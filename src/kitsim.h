@@ -57,4 +57,30 @@ void kit_simulate(const unsigned char *code, int len, unsigned base, double seco
  * picture = 1: include the dot-matrix pictures and 7-segment digits. malloc'd. */
 char *kit_sim_text(const KitSimReport *r, int picture);
 
+/* ---- the Simulator panel: the same model, run step by step or in real time ---- */
+typedef struct KitMachine KitMachine;
+
+typedef struct {
+    unsigned short ax, bx, cx, dx, si, di, bp, sp, cs, ds, es, ss, ip, flags;
+    unsigned long long cycles;            /* kit clock cycles since reset (4.9152 MHz) */
+    unsigned long insns;
+    int stop, stop_int, stop_op;          /* stop: -1 = can run, else SIM_... */
+    unsigned char p1[3], p2[3];           /* 8255 #1 (dot matrix) and #2 (LEDs, 7-seg): A, B, C */
+    unsigned char p1cr, p2cr;             /* control words (0 = not set up) */
+    int p1_set, p2_set;
+    unsigned char dm_red[64], dm_green[64];   /* brightness 0..255, index row*8+col (0,0 = top left) */
+    unsigned char seg[8];                     /* a b c d e f g dp */
+    unsigned char led[4];                     /* PB0..PB3 */
+    char lcd[2][17];
+    int lcd_on;
+} KitView;
+
+KitMachine *km_new(const unsigned char *code, int len, unsigned base);
+void km_free(KitMachine *k);
+void km_reset(KitMachine *k);                              /* back to the start, as after RESET */
+int  km_run(KitMachine *k, unsigned long long cycles);     /* returns -1 or the SIM_... stop */
+int  km_step(KitMachine *k);                               /* one instruction */
+/* registers, ports and what the displays showed since the last call */
+void km_view(KitMachine *k, KitView *v);
+
 #endif

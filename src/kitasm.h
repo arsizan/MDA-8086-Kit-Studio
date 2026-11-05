@@ -13,6 +13,8 @@ typedef struct {
     unsigned char *code;        /* bytes for 0000:1000 onwards (malloc'd, NULL if failed) */
     int            len;         /* number of bytes in code */
     char           problem[512];/* short explanation when ok == 0 and errors == 0 */
+    int           *lines;       /* source line of the instruction at each code byte (0 = none),
+                                   len entries, from the listing (may be NULL) */
 } KitAsmResult;
 
 /* Assemble source file 'src'. 'tmpdir' must be a writable folder (with or

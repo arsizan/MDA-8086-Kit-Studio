@@ -25,6 +25,16 @@ enum { JOB_NONE, JOB_RUN, JOB_CMD, JOB_FIND, JOB_PORT };
 static GtkWidget *w_main, *w_edit, *w_out, *w_cmd, *w_port, *w_btnAsm, *w_btnRun, *w_btnStop,
                  *w_btnRefresh, *w_btnSend, *w_sbPos, *w_sbFile, *w_sbKit;
 static GtkTextBuffer *b_edit, *b_out;
+/* Simulator panel (right side) */
+static GtkWidget *w_simBox, *w_simArea, *w_simPause, *w_speed, *w_speedLbl, *w_hpaned, *w_simCheck,
+                 *w_floatCheck, *w_simWin;     /* w_simWin: the simulator in its own window */
+static GtkTextTag *t_simLine;
+static KitSimCtl g_sim;
+static guint g_simTimer;
+static gint64 g_simTick;
+static int g_simMarked;            /* a line of the editor is marked (yellow) */
+static guint g_simMarkIdle;
+static const double SPEEDS[7] = { 1.0 / 1000, 1.0 / 300, 1.0 / 100, 1.0 / 30, 1.0 / 10, 1.0 / 3, 1.0 };
 static GtkTextTag *t_kind[12];
 static GtkTextMark *m_outEnd;
 static GtkAccelGroup *g_accel;
@@ -575,7 +585,7 @@ static void on_template(GtkMenuItem *it, gpointer data)
 
 /* ------------------------------------------------------------------ assemble, run */
 /* assembles the editor text; on success returns malloc'd .ABS text */
-static char *assemble(int quiet_dump)
+static char *assemble_ex(int quiet_dump, KitUiProgram *prog)
 {
     char src[4200];
     char *text, *abs;
@@ -597,9 +607,266 @@ static char *assemble(int quiet_dump)
          (g_shownName[0] ? g_shownName : "(not saved yet)"));
     text = editor_text();
     abs = kitui_assemble(src, g_path[0] ? kitui_file_part(g_path) : (g_shownName[0] ? g_shownName : "UNTITLED.ASM"),
-                         text, g_tmpdir, g_path[0] ? g_path : NULL, quiet_dump, ui_out);
+                         text, g_tmpdir, g_path[0] ? g_path : NULL, quiet_dump, ui_out, prog);
     g_free(text);
     return abs;
+}
+
+static char *assemble(int quiet_dump) { return assemble_ex(quiet_dump, NULL); }
+
+/* ------------------------------------------------------------------ simulator panel */
+static void cd_rgb(cairo_t *cr, unsigned c)
+{
+    cairo_set_source_rgb(cr, ((c >> 16) & 255) / 255.0, ((c >> 8) & 255) / 255.0, (c & 255) / 255.0);
+}
+
+static void cd_rect(void *ctx, double x, double y, double w, double h, double r, unsigned fill, unsigned line)
+{
+    cairo_t *cr = (cairo_t *)ctx;
+    if (line != KV_NONE) { x += 0.5; y += 0.5; w -= 1; h -= 1; }     /* sharp 1-pixel outlines */
+    if (r > 0.5) {
+        cairo_new_sub_path(cr);
+        cairo_arc(cr, x + w - r, y + r, r, -G_PI / 2, 0);
+        cairo_arc(cr, x + w - r, y + h - r, r, 0, G_PI / 2);
+        cairo_arc(cr, x + r, y + h - r, r, G_PI / 2, G_PI);
+        cairo_arc(cr, x + r, y + r, r, G_PI, 3 * G_PI / 2);
+        cairo_close_path(cr);
+    } else {
+        cairo_rectangle(cr, x, y, w, h);
+    }
+    if (fill != KV_NONE) {
+        cd_rgb(cr, fill);
+        if (line != KV_NONE) cairo_fill_preserve(cr); else cairo_fill(cr);
+    }
+    if (line != KV_NONE) {
+        cd_rgb(cr, line);
+        cairo_set_line_width(cr, 1.0);
+        cairo_stroke(cr);
+    }
+}
+
+static void cd_circle(void *ctx, double cx, double cy, double r, unsigned fill, unsigned line, double width)
+{
+    cairo_t *cr = (cairo_t *)ctx;
+    cairo_new_path(cr);
+    cairo_arc(cr, cx, cy, r, 0, 2 * G_PI);
+    if (fill != KV_NONE) {
+        cd_rgb(cr, fill);
+        if (line != KV_NONE) cairo_fill_preserve(cr); else cairo_fill(cr);
+    }
+    if (line != KV_NONE) {
+        cd_rgb(cr, line);
+        cairo_set_line_width(cr, width);
+        cairo_stroke(cr);
+    }
+}
+
+static void cd_poly(void *ctx, const double *xy, int n, unsigned fill)
+{
+    cairo_t *cr = (cairo_t *)ctx;
+    int i;
+    cairo_new_path(cr);
+    cairo_move_to(cr, xy[0], xy[1]);
+    for (i = 1; i < n; i++) cairo_line_to(cr, xy[2 * i], xy[2 * i + 1]);
+    cairo_close_path(cr);
+    cd_rgb(cr, fill);
+    cairo_fill(cr);
+}
+
+static void cd_text(void *ctx, double x, double y, const char *str, double size, int flags, unsigned color)
+{
+    cairo_t *cr = (cairo_t *)ctx;
+    cairo_font_extents_t fe;
+    cairo_select_font_face(cr, (flags & KV_MONO) ? "Monospace" : "Sans", CAIRO_FONT_SLANT_NORMAL,
+                           (flags & KV_BOLD) ? CAIRO_FONT_WEIGHT_BOLD : CAIRO_FONT_WEIGHT_NORMAL);
+    cairo_set_font_size(cr, size);
+    cairo_font_extents(cr, &fe);
+    if (flags & (KV_CENTER | KV_RIGHT)) {
+        cairo_text_extents_t te;
+        cairo_text_extents(cr, str, &te);
+        x -= (flags & KV_CENTER) ? te.x_advance / 2 : te.x_advance;
+    }
+    cd_rgb(cr, color);
+    cairo_move_to(cr, x, y + fe.ascent);
+    cairo_show_text(cr, str);
+}
+
+static gboolean on_sim_draw(GtkWidget *w, cairo_t *cr, gpointer data)
+{
+    KitDraw kd;
+    (void)data;
+    kd.ctx = cr;
+    kd.rect = cd_rect;
+    kd.circle = cd_circle;
+    kd.poly = cd_poly;
+    kd.text = cd_text;
+    kitview_draw(&kd, gtk_widget_get_allocated_width(w), gtk_widget_get_allocated_height(w), &g_sim.panel);
+    return FALSE;
+}
+
+/* refresh the panel; when the program does not run, mark the next line in the editor */
+static void sim_show(void)
+{
+    GtkTextIter a, b;
+    kitsim_update(&g_sim);
+    gtk_widget_queue_draw(w_simArea);
+    gtk_widget_set_sensitive(w_simPause, g_sim.panel.running);
+    gtk_text_buffer_get_bounds(b_edit, &a, &b);
+    gtk_text_buffer_remove_tag(b_edit, t_simLine, &a, &b);
+    g_simMarked = 0;
+    if (!g_sim.panel.running && g_sim.panel.line > 0 && g_sim.panel.line <= gtk_text_buffer_get_line_count(b_edit)) {
+        gtk_text_buffer_get_iter_at_line(b_edit, &a, g_sim.panel.line - 1);
+        b = a;
+        if (!gtk_text_iter_ends_line(&b)) gtk_text_iter_forward_to_line_end(&b);
+        gtk_text_iter_forward_char(&b);
+        gtk_text_buffer_apply_tag(b_edit, t_simLine, &a, &b);
+        g_simMarked = 1;
+        gtk_text_view_scroll_to_iter(GTK_TEXT_VIEW(w_edit), &a, 0.15, FALSE, 0, 0);
+    }
+}
+
+/* the editor's program in the simulator: assembled again only when the text changed */
+static int sim_prepare(int *fresh)
+{
+    char *text = editor_text(), *abs;
+    KitUiProgram prog;
+    *fresh = 0;
+    if (text && kitsim_same_source(&g_sim, text)) { g_free(text); return 1; }
+    g_free(text);
+    memset(&prog, 0, sizeof prog);
+    abs = assemble_ex(1, &prog);
+    if (!abs) { kitui_free_program(&prog); return 0; }
+    free(abs);
+    text = editor_text();
+    kitsim_load(&g_sim, &prog, text ? text : "");
+    g_free(text);
+    outf(KO_INFO, "Simulator: program loaded (%d bytes at 0000:1000).", g_sim.prog.len);
+    *fresh = 1;
+    return 1;
+}
+
+static gboolean sim_tick(gpointer data)
+{
+    gint64 now = g_get_monotonic_time();
+    (void)data;
+    if (g_closing) { g_simTimer = 0; return FALSE; }
+    kitsim_tick(&g_sim, (now - g_simTick) / 1000000.0);
+    g_simTick = now;
+    sim_show();
+    if (!g_sim.panel.running) { g_simTimer = 0; return FALSE; }
+    return TRUE;
+}
+
+static void sim_stop_timer(void)
+{
+    if (g_simTimer) { g_source_remove(g_simTimer); g_simTimer = 0; }
+}
+
+static void act_simrun(void)
+{
+    int fresh;
+    if (!sim_prepare(&fresh)) return;
+    if (g_sim.panel.v.stop >= 0) kitsim_reset(&g_sim);     /* it had stopped: start again */
+    g_sim.panel.running = 1;
+    g_simTick = g_get_monotonic_time();
+    if (!g_simTimer) g_simTimer = g_timeout_add(30, sim_tick, NULL);
+    sim_show();
+}
+
+static void act_simstep(void)
+{
+    int fresh;
+    if (!sim_prepare(&fresh)) return;
+    sim_stop_timer();
+    g_sim.panel.running = 0;
+    if (!fresh) {                       /* just loaded: first show where it starts */
+        if (g_sim.panel.v.stop >= 0) kitsim_reset(&g_sim);
+        else kitsim_step(&g_sim);
+    }
+    sim_show();
+}
+
+static void act_simpause(void)
+{
+    if (!g_sim.panel.running) return;
+    g_sim.panel.running = 0;
+    sim_stop_timer();
+    sim_show();
+}
+
+static void act_simreset(void)
+{
+    sim_stop_timer();
+    kitsim_reset(&g_sim);
+    sim_show();
+}
+
+static void on_speed(GtkRange *r, gpointer data)
+{
+    char buf[40];
+    int i = (int)(gtk_range_get_value(r) + 0.5);
+    (void)data;
+    if (i < 0) i = 0;
+    if (i > 6) i = 6;
+    g_sim.panel.speed = SPEEDS[i];
+    kitview_speed_text(SPEEDS[i], buf, sizeof buf);
+    gtk_label_set_text(GTK_LABEL(w_speedLbl), buf);
+    gtk_widget_queue_draw(w_simArea);
+}
+
+/* Simulator > Separate window: the panel in its own window (like emu8086), for small screens */
+static gboolean on_simwin_delete(GtkWidget *w, GdkEvent *ev, gpointer data)
+{
+    (void)w; (void)ev; (void)data;
+    gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(w_floatCheck), FALSE);    /* back to the main window */
+    return TRUE;
+}
+
+static void sim_set_float(int on)
+{
+    if (on == (w_simWin != NULL)) return;
+    g_object_ref(w_simBox);
+    gtk_container_remove(GTK_CONTAINER(gtk_widget_get_parent(w_simBox)), w_simBox);
+    if (on) {
+        GdkRectangle wa;
+        GdkScreen *scr = gdk_screen_get_default();
+        int W = 600, H = 720;
+        gdk_screen_get_monitor_workarea(scr, gdk_screen_get_primary_monitor(scr), &wa);
+        if (wa.height > 200 && H > wa.height - 30) H = wa.height - 30;
+        if (wa.width > 200 && W > wa.width - 40) W = wa.width - 40;
+        w_simWin = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+        gtk_window_set_title(GTK_WINDOW(w_simWin), "Simulator - " APP_NAME);
+        gtk_window_set_transient_for(GTK_WINDOW(w_simWin), GTK_WINDOW(w_main));   /* stays above the editor */
+        gtk_window_set_default_size(GTK_WINDOW(w_simWin), W, H);
+        gtk_window_add_accel_group(GTK_WINDOW(w_simWin), g_accel);                 /* F6, F8, F9 work here too */
+        g_signal_connect(w_simWin, "delete-event", G_CALLBACK(on_simwin_delete), NULL);
+        gtk_container_add(GTK_CONTAINER(w_simWin), w_simBox);
+        if (wa.width > 200) gtk_window_move(GTK_WINDOW(w_simWin), wa.x + wa.width - W - 4, wa.y + 4);
+        gtk_widget_show_all(w_simWin);
+        on_speed(GTK_RANGE(w_speed), NULL);
+    } else {
+        gtk_paned_pack2(GTK_PANED(w_hpaned), w_simBox, TRUE, FALSE);
+        gtk_widget_destroy(w_simWin);
+        w_simWin = NULL;
+    }
+    g_object_unref(w_simBox);
+}
+
+static void on_sim_float(GtkCheckMenuItem *it, gpointer data)
+{
+    int on = gtk_check_menu_item_get_active(it);
+    (void)data;
+    if (on && !gtk_check_menu_item_get_active(GTK_CHECK_MENU_ITEM(w_simCheck)))
+        gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(w_simCheck), TRUE);
+    sim_set_float(on);
+}
+
+static void on_sim_panel(GtkCheckMenuItem *it, gpointer data)
+{
+    int on = gtk_check_menu_item_get_active(it);
+    (void)data;
+    if (!on && w_simWin) gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(w_floatCheck), FALSE);
+    gtk_widget_set_visible(w_simBox, on);
 }
 
 static void do_assemble(void)
@@ -864,7 +1131,23 @@ static void on_mark_set(GtkTextBuffer *b, GtkTextIter *it, GtkTextMark *m, gpoin
     if (m == gtk_text_buffer_get_insert(b)) update_pos();
 }
 
-static void on_edit_changed(GtkTextBuffer *b, gpointer data) { (void)b; (void)data; update_pos(); }
+static gboolean clear_sim_mark(gpointer data)
+{
+    GtkTextIter a, b;
+    (void)data;
+    g_simMarkIdle = 0;
+    gtk_text_buffer_get_bounds(b_edit, &a, &b);
+    gtk_text_buffer_remove_tag(b_edit, t_simLine, &a, &b);
+    g_simMarked = 0;
+    return FALSE;
+}
+
+static void on_edit_changed(GtkTextBuffer *b, gpointer data)
+{
+    (void)b; (void)data;
+    update_pos();
+    if (g_simMarked && !g_simMarkIdle) g_simMarkIdle = g_idle_add(clear_sim_mark, NULL);
+}
 static void on_modified_changed(GtkTextBuffer *b, gpointer data) { (void)b; (void)data; update_title(); }
 
 /* the kit command box shows capital letters, like the kit's own commands */
@@ -996,6 +1279,19 @@ static GtkWidget *make_menu(void)
     add_sep(m);
     add_item(m, "_Find kit (connect)", act_find, 0, 0);
     add_item(m, "_Clear output", act_clear, 0, 0);
+    m = add_menu(bar, "_Simulator");
+    add_item(m, "_Run in simulator", act_simrun, GDK_KEY_F6, 0);
+    add_item(m, "_Step (one instruction)", act_simstep, GDK_KEY_F8, 0);
+    add_item(m, "_Pause", act_simpause, GDK_KEY_F9, 0);
+    add_item(m, "R_eset", act_simreset, 0, 0);
+    add_sep(m);
+    w_simCheck = gtk_check_menu_item_new_with_mnemonic("Show simulator _panel");
+    gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(w_simCheck), TRUE);
+    g_signal_connect(w_simCheck, "toggled", G_CALLBACK(on_sim_panel), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(m), w_simCheck);
+    w_floatCheck = gtk_check_menu_item_new_with_mnemonic("Separate _window");
+    g_signal_connect(w_floatCheck, "toggled", G_CALLBACK(on_sim_float), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(m), w_floatCheck);
     m = add_menu(bar, "E_xamples");                  /* built into the program: no folder needed */
     for (i = 0; i < kit_nexamples; i++) {
         GtkWidget *it = gtk_menu_item_new_with_label(kit_examples[i].menu);
@@ -1112,16 +1408,82 @@ static void set_icon(void)
     g_object_unref(ld);
 }
 
+static GtkWidget *sim_button(const char *label, void (*fn)(void), const char *tip)
+{
+    GtkWidget *b = make_button(label, fn);
+    gtk_widget_set_tooltip_text(b, tip);
+    return b;
+}
+
+/* right side: simulator buttons, speed and the kit picture */
+static GtkWidget *build_sim_panel(void)
+{
+    GtkWidget *box, *row, *srow, *lbl, *frame;
+    int i;
+    box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+
+    row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    gtk_container_set_border_width(GTK_CONTAINER(row), 6);
+    gtk_box_pack_start(GTK_BOX(row), sim_button("Run (F6)", act_simrun, "Run the program in the simulator (no kit needed)"), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(row), sim_button("Step (F8)", act_simstep, "Run one instruction; the next line is marked yellow"), FALSE, FALSE, 0);
+    w_simPause = sim_button("Pause (F9)", act_simpause, "Stop here (Run continues, Step goes on one by one)");
+    gtk_box_pack_start(GTK_BOX(row), w_simPause, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(row), sim_button("Reset", act_simreset, "Start the program again from 0000:1000"), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(box), row, FALSE, FALSE, 0);
+
+    srow = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    gtk_widget_set_margin_left(srow, 8);
+    gtk_widget_set_margin_right(srow, 8);
+    lbl = gtk_label_new("Speed:");
+    gtk_box_pack_start(GTK_BOX(srow), lbl, FALSE, FALSE, 0);
+    w_speed = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 0, 6, 1);
+    gtk_scale_set_draw_value(GTK_SCALE(w_speed), FALSE);
+    gtk_range_set_round_digits(GTK_RANGE(w_speed), 0);
+    for (i = 0; i <= 6; i++) gtk_scale_add_mark(GTK_SCALE(w_speed), i, GTK_POS_BOTTOM, NULL);
+    gtk_range_set_value(GTK_RANGE(w_speed), 6);
+    gtk_widget_set_size_request(w_speed, 110, -1);
+    gtk_widget_set_tooltip_text(w_speed, "Slow motion: move left to watch the displays change step by step");
+    g_signal_connect(w_speed, "value-changed", G_CALLBACK(on_speed), NULL);
+    gtk_box_pack_start(GTK_BOX(srow), w_speed, TRUE, TRUE, 0);
+    w_speedLbl = gtk_label_new("");
+    gtk_label_set_width_chars(GTK_LABEL(w_speedLbl), 20);
+    gtk_misc_set_alignment(GTK_MISC(w_speedLbl), 0, 0.5);
+    gtk_box_pack_start(GTK_BOX(srow), w_speedLbl, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(box), srow, FALSE, FALSE, 0);
+
+    w_simArea = gtk_drawing_area_new();
+    gtk_widget_set_size_request(w_simArea, 300, 330);
+    g_signal_connect(w_simArea, "draw", G_CALLBACK(on_sim_draw), NULL);
+    frame = gtk_frame_new(NULL);
+    gtk_frame_set_shadow_type(GTK_FRAME(frame), GTK_SHADOW_IN);
+    gtk_container_add(GTK_CONTAINER(frame), w_simArea);
+    gtk_container_set_border_width(GTK_CONTAINER(frame), 6);
+    gtk_box_pack_start(GTK_BOX(box), frame, TRUE, TRUE, 0);
+    on_speed(GTK_RANGE(w_speed), NULL);
+    return box;
+}
+
 static void build_window(void)
 {
-    GtkWidget *vbox, *tool, *paned, *cmdrow, *status, *lbl;
+    GtkWidget *vbox, *left, *tool, *paned, *cmdrow, *status, *lbl;
     PangoFontDescription *mono = pango_font_description_from_string("Monospace 10");
     GtkTextIter end;
-    int i;
+    GdkRectangle wa;
+    GdkScreen *scr = gdk_screen_get_default();
+    int i, W = 1320, H = 820, simW;
+
+    /* window size: room for the editor and the simulator, but never bigger than the screen */
+    gdk_screen_get_monitor_workarea(scr, gdk_screen_get_primary_monitor(scr), &wa);
+    if (wa.width > 200 && W > wa.width - 16) W = wa.width - 16;
+    if (wa.height > 200 && H > wa.height - 40) H = wa.height - 40;
+    simW = W * 45 / 100;
+    if (W - simW < 620) simW = W - 620;
+    if (simW < 330) simW = 330;
 
     w_main = gtk_window_new(GTK_WINDOW_TOPLEVEL);
-    gtk_window_set_default_size(GTK_WINDOW(w_main), 940, 680);
-    gtk_widget_set_size_request(w_main, 560, 400);
+    gtk_window_set_default_size(GTK_WINDOW(w_main), W, H);
+    gtk_window_set_position(GTK_WINDOW(w_main), GTK_WIN_POS_CENTER);
+    if (wa.width > 200 && wa.width < 1200) gtk_window_maximize(GTK_WINDOW(w_main));
     g_accel = gtk_accel_group_new();
     gtk_window_add_accel_group(GTK_WINDOW(w_main), g_accel);
     g_signal_connect(w_main, "delete-event", G_CALLBACK(on_delete), NULL);
@@ -1131,6 +1493,7 @@ static void build_window(void)
     gtk_container_add(GTK_CONTAINER(w_main), vbox);
     gtk_box_pack_start(GTK_BOX(vbox), make_menu(), FALSE, FALSE, 0);
 
+    left = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     tool = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
     gtk_container_set_border_width(GTK_CONTAINER(tool), 6);
     w_btnAsm = make_button("Assemble (F7)", act_asm);
@@ -1140,19 +1503,20 @@ static void build_window(void)
     gtk_box_pack_start(GTK_BOX(tool), w_btnRun, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(tool), w_btnStop, FALSE, FALSE, 0);
     lbl = gtk_label_new("Port:");
-    gtk_box_pack_start(GTK_BOX(tool), lbl, FALSE, FALSE, 12);
+    gtk_box_pack_start(GTK_BOX(tool), lbl, FALSE, FALSE, 6);
     w_port = gtk_combo_box_text_new();
-    gtk_widget_set_size_request(w_port, 170, -1);
+    gtk_widget_set_size_request(w_port, 150, -1);
     g_signal_connect(w_port, "changed", G_CALLBACK(on_port_changed), NULL);
     gtk_box_pack_start(GTK_BOX(tool), w_port, FALSE, FALSE, 0);
     w_btnRefresh = make_button("Refresh", fill_ports);
     gtk_box_pack_start(GTK_BOX(tool), w_btnRefresh, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(vbox), tool, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(left), tool, FALSE, FALSE, 0);
 
     w_edit = gtk_text_view_new();
     b_edit = gtk_text_view_get_buffer(GTK_TEXT_VIEW(w_edit));
     style_text_view(w_edit, mono);
     set_tabs_8(w_edit);
+    t_simLine = gtk_text_buffer_create_tag(b_edit, NULL, "paragraph-background", "#FFE98A", NULL);
     g_signal_connect(b_edit, "insert-text", G_CALLBACK(on_insert_text), NULL);
     g_signal_connect(b_edit, "delete-range", G_CALLBACK(on_delete_range), NULL);
     g_signal_connect(b_edit, "mark-set", G_CALLBACK(on_mark_set), NULL);
@@ -1175,21 +1539,29 @@ static void build_window(void)
     paned = gtk_paned_new(GTK_ORIENTATION_VERTICAL);
     gtk_paned_pack1(GTK_PANED(paned), scrolled(w_edit), TRUE, FALSE);
     gtk_paned_pack2(GTK_PANED(paned), scrolled(w_out), TRUE, FALSE);
-    gtk_paned_set_position(GTK_PANED(paned), 360);
+    gtk_paned_set_position(GTK_PANED(paned), H > 600 ? H - 330 : 300);
     gtk_container_set_border_width(GTK_CONTAINER(paned), 6);
-    gtk_box_pack_start(GTK_BOX(vbox), paned, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(left), paned, TRUE, TRUE, 0);
 
     cmdrow = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
     gtk_container_set_border_width(GTK_CONTAINER(cmdrow), 6);
     w_cmd = gtk_entry_new();
     gtk_entry_set_max_length(GTK_ENTRY(w_cmd), 120);
+    gtk_entry_set_width_chars(GTK_ENTRY(w_cmd), 10);
     gtk_widget_override_font(w_cmd, mono);
     g_signal_connect(w_cmd, "insert-text", G_CALLBACK(on_cmd_insert), NULL);
     g_signal_connect(w_cmd, "activate", G_CALLBACK(on_button), (gpointer)do_send_cmd);
     w_btnSend = make_button("Send to kit", do_send_cmd);
     gtk_box_pack_start(GTK_BOX(cmdrow), w_cmd, TRUE, TRUE, 0);
     gtk_box_pack_start(GTK_BOX(cmdrow), w_btnSend, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(vbox), cmdrow, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(left), cmdrow, FALSE, FALSE, 0);
+
+    w_simBox = build_sim_panel();
+    w_hpaned = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
+    gtk_paned_pack1(GTK_PANED(w_hpaned), left, TRUE, FALSE);
+    gtk_paned_pack2(GTK_PANED(w_hpaned), w_simBox, TRUE, FALSE);
+    gtk_paned_set_position(GTK_PANED(w_hpaned), W - simW);
+    gtk_box_pack_start(GTK_BOX(vbox), w_hpaned, TRUE, TRUE, 0);
 
     status = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
     gtk_container_set_border_width(GTK_CONTAINER(status), 4);
@@ -1240,6 +1612,8 @@ int main(int argc, char **argv)
     g_redo = g_ptr_array_new_with_free_func(undo_free_act);
     make_folders();
     set_icon();
+    kitsim_unload(&g_sim);          /* empty simulator: nothing loaded yet */
+    g_sim.panel.speed = 1.0;
     build_window();
 
     set_editor_text("", NULL, NULL, NULL);       /* always start with an empty editor */
@@ -1248,11 +1622,21 @@ int main(int argc, char **argv)
     fill_ports();
     set_busy_ui(0, NULL);
     gtk_widget_show_all(w_main);
+    {
+        GdkRectangle wa;
+        GdkScreen *scr = gdk_screen_get_default();
+        gdk_screen_get_monitor_workarea(scr, gdk_screen_get_primary_monitor(scr), &wa);
+        if (wa.width > 200 && wa.width < 1200)       /* not enough room side by side */
+            gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(w_floatCheck), TRUE);
+    }
+    sim_show();
     gtk_widget_grab_focus(w_edit);
     if (argc > 1) open_path(argv[1]);
 
     g_thread = g_thread_new("kit", worker, NULL);
     gtk_main();
     stop_worker();
+    sim_stop_timer();
+    kitsim_unload(&g_sim);
     return 0;
 }

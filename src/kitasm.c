@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <setjmp.h>
+#include <ctype.h>
 #include "kitasm.h"
 
 /* ---- JWasm entry points (compiled with -Dexit=jw_exit) ---- */
@@ -254,10 +255,51 @@ static char *clean_messages(char *raw, int *errors, int *warnings)
     return out;
 }
 
+/* source line of each instruction, from the assembler's listing (for the simulator):
+ * the listing has one line per source line (after 2 title lines); code lines start with
+ * the offset, e.g. "1005 B080          MOV AL, 80H" */
+static void read_listing(const char *path, KitAsmResult *res)
+{
+    FILE *f = fopen(path, "r");
+    char line[1200];
+    int idx = 0, src_line = 0, in_code = 1;
+    if (!f) return;
+    res->lines = (int *)calloc(res->len > 0 ? res->len : 1, sizeof(int));
+    if (!res->lines) { fclose(f); return; }
+    while (fgets(line, sizeof line, f)) {
+        const char *t, *p;
+        char up[200], w1[64] = "", w2[64] = "";
+        int k;
+        if (++idx <= 2) continue;                       /* "JWasm v2.21 ..." and the file name */
+        if (!strncmp(line, "Binary Map", 10) || !strncmp(line, "Macros:", 7) ||
+            !strncmp(line, "Segments and Groups", 19)) break;
+        for (p = line; *p == ' ' || *p == '\t'; p++) ;
+        if (!strncmp(p, "Warning A", 9) || !strncmp(p, "Error A", 7)) continue;   /* not a source line */
+        src_line++;
+        t = strlen(line) > 32 ? line + 32 : "";         /* the source text, without its comment */
+        for (k = 0; k < (int)sizeof up - 1 && t[k] && t[k] != '\n' && t[k] != ';'; k++)
+            up[k] = (char)toupper((unsigned char)t[k]);
+        up[k] = 0;
+        sscanf(up, "%63s %63s", w1, w2);
+        if (!strcmp(w1, ".CODE")) in_code = 1;
+        else if (!strncmp(w1, ".DATA", 5) || !strcmp(w1, ".STACK") || !strcmp(w1, ".CONST") ||
+                 !strncmp(w1, ".FARDATA", 8)) in_code = 0;
+        else if (!strcmp(w2, "SEGMENT")) in_code = strstr(w1, "CODE") || strstr(w1, "TEXT") || strstr(w1, "CSEG");
+        if (isxdigit((unsigned char)line[0]) && isxdigit((unsigned char)line[1]) &&
+            isxdigit((unsigned char)line[2]) && isxdigit((unsigned char)line[3]) && line[4] == ' ' &&
+            line[5] != ' ' && line[5] != '\n' && in_code) {
+            unsigned off = (unsigned)strtoul(line, NULL, 16);
+            if (off >= KIT_ORG && off < KIT_ORG + (unsigned)res->len && !res->lines[off - KIT_ORG])
+                res->lines[off - KIT_ORG] = src_line;
+        }
+    }
+    fclose(f);
+}
+
 int kit_assemble(const char *src, const char *tmpdir, KitAsmResult *res)
 {
-    char exe[1024], err[1024], fo[1100], fw[1100], fsrc[1100];
-    const char *argv[9];
+    char exe[1024], err[1024], lst[1024], fo[1100], fw[1100], fl[1100], fsrc[1100];
+    const char *argv[10];
     int numargs = 0;
     volatile int rc = 0, files = 0;
     long n;
@@ -267,8 +309,10 @@ int kit_assemble(const char *src, const char *tmpdir, KitAsmResult *res)
     memset(res, 0, sizeof(*res));
     join_path(exe, sizeof exe, tmpdir, "kitstudio_out.exe");
     join_path(err, sizeof err, tmpdir, "kitstudio_out.err");
+    join_path(lst, sizeof lst, tmpdir, "kitstudio_out.lst");
     remove(exe);
     remove(err);
+    remove(lst);
     {   /* make sure the source file exists before starting the assembler */
         FILE *f = fopen(src, "rb");
         if (!f) {
@@ -279,6 +323,7 @@ int kit_assemble(const char *src, const char *tmpdir, KitAsmResult *res)
     }
     snprintf(fo, sizeof fo, "-Fo\"%s\"", exe);
     snprintf(fw, sizeof fw, "-Fw\"%s\"", err);
+    snprintf(fl, sizeof fl, "-Fl\"%s\"", lst);
     snprintf(fsrc, sizeof fsrc, "\"%s\"", src);
     argv[0] = "";          /* contents of the JWASM environment variable */
     argv[1] = "-mz";       /* MZ executable, like LINK makes */
@@ -287,8 +332,9 @@ int kit_assemble(const char *src, const char *tmpdir, KitAsmResult *res)
     argv[4] = "-eq";       /* messages only into the .err file, not on the console (Linux terminal) */
     argv[5] = fo;
     argv[6] = fw;
-    argv[7] = fsrc;
-    argv[8] = NULL;
+    argv[7] = fl;          /* listing: source line of each instruction, for the simulator */
+    argv[8] = fsrc;
+    argv[9] = NULL;
 
     if (setjmp(jw_env) == 0) {
         char *name;
@@ -312,6 +358,7 @@ int kit_assemble(const char *src, const char *tmpdir, KitAsmResult *res)
         snprintf(res->problem, sizeof res->problem, "The assembler did not get the file name.");
     if (rc != 1 || res->errors) {
         remove(exe);
+        remove(lst);
         if (!res->errors && !res->problem[0])
             snprintf(res->problem, sizeof res->problem, "Assembly failed.");
         return 0;
@@ -327,6 +374,8 @@ int kit_assemble(const char *src, const char *tmpdir, KitAsmResult *res)
         return 0;
     }
     free(img);
+    read_listing(lst, res);
+    remove(lst);
     res->ok = 1;
     return 1;
 }
@@ -335,5 +384,6 @@ void kit_asm_free(KitAsmResult *res)
 {
     free(res->messages);
     free(res->code);
+    free(res->lines);
     memset(res, 0, sizeof(*res));
 }
