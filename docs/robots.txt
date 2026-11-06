@@ -1,0 +1,3 @@
+User-agent: *
+Allow: /
+Sitemap: https://arsizan.github.io/MDA-8086-Kit-Studio/sitemap.xml

@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MDA-8086 Kit Studio – 8086 Trainer Kit Software &amp; Simulator</title>
+<meta name="description" content="Free Windows and Linux program for the MDA-8086 microprocessor trainer kit: write 8086 assembly, assemble it, simulate the dot matrix, 7-segment and LCD, and send programs to the kit.">
+<link rel="canonical" href="https://arsizan.github.io/MDA-8086-Kit-Studio/">
+<meta property="og:type" content="website">
+<meta property="og:title" content="MDA-8086 Kit Studio – 8086 Trainer Kit Software &amp; Simulator">
+<meta property="og:description" content="Write 8086 assembly, simulate the MDA-8086 kit and send programs to it over serial. Free for Windows and Linux.">
+<meta property="og:url" content="https://arsizan.github.io/MDA-8086-Kit-Studio/">
+<meta property="og:image" content="https://arsizan.github.io/MDA-8086-Kit-Studio/og.png">
+<meta property="og:image:width" content="1280">
+<meta property="og:image:height" content="640">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%23111a1c'/%3E%3Ccircle cx='5' cy='5' r='2' fill='%23ff5a47'/%3E%3Ccircle cx='11' cy='5' r='2' fill='%2339d98a'/%3E%3Ccircle cx='5' cy='11' r='2' fill='%2339d98a'/%3E%3Ccircle cx='11' cy='11' r='2' fill='%23ff5a47'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@400;500;700&display=swap">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "MDA-8086 Kit Studio",
+  "softwareVersion": "3.0",
+  "operatingSystem": "Windows, Linux",
+  "applicationCategory": "DeveloperApplication",
+  "description": "Program for the MDA-8086 microprocessor trainer kit: 8086 assembly editor, built-in assembler, kit simulator and serial download to the kit.",
+  "url": "https://arsizan.github.io/MDA-8086-Kit-Studio/",
+  "downloadUrl": "https://github.com/arsizan/MDA-8086-Kit-Studio/releases/latest",
+  "codeRepository": "https://github.com/arsizan/MDA-8086-Kit-Studio",
+  "author": {"@type": "Person", "name": "arsizan", "url": "https://github.com/arsizan"},
+  "offers": {"@type": "Offer", "price": "0", "priceCurrency": "USD"}
+}
+</script>
+<style>
+/* Layout: kit-panel look. Hero = name + downloads beside a lit 8x8 dot matrix; then features, kit steps, port table, FAQ. */
+:root {
+  --bg: #0e1517; --panel: #152124; --line: #24363a; --ink: #e7eeec; --muted: #9db0ad;
+  --red: #ff5a47; --green: #39d98a; --amber: #ffb43c; --off: #233135;
+  --sans: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif; --mono: "IBM Plex Mono", Consolas, ui-monospace, monospace;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--sans); font-size: 17px; line-height: 1.6; }
+a { color: var(--green); }
+.wrap { max-width: 1080px; margin: 0 auto; padding-left: max(18px, env(safe-area-inset-left, 0px)); padding-right: max(18px, env(safe-area-inset-right, 0px)); }
+header.top { border-bottom: 1px solid var(--line); }
+.top .wrap { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 20px; padding-block: 14px; }
+.brand { font-family: var(--mono); font-weight: 600; color: var(--ink); text-decoration: none; }
+.brand b { color: var(--red); }
+nav { display: flex; flex-wrap: wrap; gap: 4px 18px; font-size: 0.95rem; }
+nav a { color: var(--muted); text-decoration: none; }
+nav a:hover { color: var(--ink); }
+.hero { display: grid; grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr); gap: 40px; align-items: center; padding-block: 56px 48px; }
+h1 { font-size: clamp(2.2rem, 5vw, 3.4rem); line-height: 1.08; margin: 0 0 14px; letter-spacing: -0.01em; }
+h2 { font-size: 1.6rem; margin: 0 0 18px; }
+.lede { font-size: 1.15rem; color: var(--muted); margin: 0 0 24px; max-width: 58ch; }
+.lede strong { color: var(--ink); font-weight: 500; }
+.btns { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 14px; }
+.btn { display: inline-flex; flex-direction: column; padding: 11px 18px; border-radius: 10px; text-decoration: none; border: 1px solid var(--line); color: var(--ink); background: var(--panel); }
+.btn small { color: var(--muted); font-size: 0.78rem; }
+.btn.main { background: var(--green); border-color: var(--green); color: #06130d; font-weight: 700; }
+.btn.main small { color: #0d3a24; }
+.btn:hover { border-color: var(--green); }
+.fine { color: var(--muted); font-size: 0.9rem; margin: 0; }
+.kit { background: var(--panel); border: 1px solid var(--line); border-radius: 18px; padding: 26px; justify-self: center; width: min(100%, 360px); }
+.matrix { display: grid; grid-template-columns: repeat(8, 1fr); gap: 7px; }
+.matrix i { aspect-ratio: 1; border-radius: 50%; background: var(--off); box-shadow: inset 0 0 0 1px #2e4246; }
+.matrix i.on { background: var(--red); box-shadow: 0 0 12px rgba(255, 90, 71, 0.55); }
+.kit .label { display: flex; justify-content: space-between; font-family: var(--mono); font-size: 0.78rem; color: var(--muted); margin-top: 14px; }
+.leds { display: flex; gap: 8px; margin-top: 12px; }
+.leds i { width: 14px; height: 14px; border-radius: 50%; background: var(--off); }
+.leds i.g { background: var(--green); box-shadow: 0 0 8px rgba(57, 217, 138, 0.6); }
+section.block { padding-block: 44px; border-top: 1px solid var(--line); }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(290px, 1fr)); gap: 16px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 18px 20px; }
+.card h3 { margin: 0 0 6px; font-size: 1.08rem; }
+.card p { margin: 0; color: var(--muted); }
+kbd, code { font-family: var(--mono); font-size: 0.88em; background: #0b1113; border: 1px solid var(--line); border-radius: 5px; padding: 0 5px; color: var(--ink); }
+ol.steps { margin: 0; padding-left: 1.3em; display: grid; gap: 10px; max-width: 72ch; }
+.tablebox { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 0.95rem; }
+th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 500; }
+td:first-child { white-space: nowrap; }
+td.port { font-family: var(--mono); color: var(--amber); white-space: nowrap; }
+details { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; margin-bottom: 10px; }
+summary { cursor: pointer; padding: 12px 16px; font-weight: 500; }
+details p { margin: 0; padding: 0 16px 14px; color: var(--muted); max-width: 75ch; }
+footer { border-top: 1px solid var(--line); padding-block: 28px 40px; color: var(--muted); font-size: 0.9rem; }
+@media (max-width: 760px) { .hero { grid-template-columns: minmax(0, 1fr); padding-block: 36px; } }
+</style>
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <a class="brand" href="https://arsizan.github.io/MDA-8086-Kit-Studio/">MDA-8086 <b>Kit Studio</b></a>
+  <nav><a href="#download">Download</a><a href="#features">Features</a><a href="#kit">Use with the kit</a><a href="#ports">Ports</a><a href="#faq">FAQ</a><a href="https://github.com/arsizan/MDA-8086-Kit-Studio">GitHub</a></nav>
+</div></header>
+
+<main>
+<div class="wrap hero" id="download">
+  <div>
+    <h1>MDA-8086 Kit Studio</h1>
+    <p class="lede">Software for the <strong>MDA-8086 microprocessor trainer kit</strong>. Write 8086 assembly, assemble it, try it in a simulator of the kit, then send it to the real kit over the serial cable. One program: no DOSBox, emu8086 or TASM needed.</p>
+    <div class="btns">
+      <a class="btn main" href="https://github.com/arsizan/MDA-8086-Kit-Studio/releases/latest/download/KitStudio_v3.0_Windows.zip">Download for Windows<small>v3.0 · XP to 11 · 32/64-bit</small></a>
+      <a class="btn" href="https://github.com/arsizan/MDA-8086-Kit-Studio/releases/latest/download/KitStudio_v3.0_Linux.tar.gz">Download for Linux<small>v3.0 · x86_64 / i386 · GTK 3</small></a>
+      <a class="btn" href="https://github.com/arsizan/MDA-8086-Kit-Studio">Source code<small>GitHub</small></a>
+    </div>
+    <p class="fine">Free. All versions are on the <a href="https://github.com/arsizan/MDA-8086-Kit-Studio/releases">releases page</a>.</p>
+  </div>
+  <div class="kit">
+    <div class="matrix" aria-hidden="true"><i class=""></i><i class=""></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class=""></i><i class=""></i><i class=""></i><i class="on"></i><i class="on"></i><i class=""></i><i class=""></i><i class="on"></i><i class="on"></i><i class=""></i><i class="on"></i><i class="on"></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class="on"></i><i class="on"></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i><i class=""></i></div>
+    <div class="leds" aria-hidden="true"><i class="g"></i><i></i><i class="g"></i><i></i></div>
+    <div class="label"><span>DOT MATRIX 8×8</span><span>OUT 18H / 1CH</span></div>
+  </div>
+</div>
+
+<section class="block" id="features"><div class="wrap">
+  <h2>What it does</h2>
+  <div class="grid">
+    <div class="card"><h3>Kit simulator</h3><p>8×8 dot matrix, 7-segment display, 4 LEDs, 16×2 LCD, registers, flags and both 8255s. Run at the real kit's speed (<kbd>F6</kbd>), step one instruction at a time (<kbd>F8</kbd>), pause (<kbd>F9</kbd>) or slow it down.</p></div>
+    <div class="card"><h3>Run on the kit</h3><p><kbd>F5</kbd> assembles, finds the kit on a COM port (9600 8N1), downloads the program and starts it at 0000:1000. A monitor box sends commands such as <code>D</code> and <code>R</code>.</p></div>
+    <div class="card"><h3>Assembler with hints</h3><p>Built-in JWasm assembler (<kbd>F7</kbd>) that makes the kit's <code>.ABS</code> file and shows the machine code. Errors come with a plain-language hint; double-click one to jump to its line.</p></div>
+    <div class="card"><h3>Kit check</h3><p>Before sending, the program runs on an 8086 model and warns about unknown ports, a missing 8255 setup, <code>INT 21H</code>, 80186+ instructions and running off the end of the program.</p></div>
+    <div class="card"><h3>Examples and templates</h3><p>7-segment count 0–9, three-colour dot-matrix rows, the letter A and a scrolling A, plus two program templates, all built in.</p></div>
+    <div class="card"><h3>Windows and Linux</h3><p>One small Win32 program for Windows XP to 11 and a GTK 3 program for 64- and 32-bit Linux. Runs from a pendrive; nothing to install on lab PCs.</p></div>
+  </div>
+</div></section>
+
+<section class="block" id="kit"><div class="wrap">
+  <h2>Use it with the MDA-8086 kit</h2>
+  <ol class="steps">
+    <li>Connect the kit's 9-pin RS-232 cable to a COM port, or to a USB-to-RS232 adapter (FTDI or CH340 chips work well).</li>
+    <li>Set the kit's <strong>SELECT MODE</strong> switch to <strong>PC</strong> and turn it on.</li>
+    <li>Write the program, or start from <em>Templates</em>. Begin with <code>ORG 1000H</code> and set up the 8255 first: <code>MOV AL,80H</code> then <code>OUT 1EH,AL</code> (dot matrix) or <code>OUT 1FH,AL</code> (7-segment, LEDs).</li>
+    <li>Press <kbd>F6</kbd> to try it in the simulator, then <kbd>F5</kbd> to run it on the kit. If the kit does not answer, press its RESET.</li>
+  </ol>
+</div></section>
+
+<section class="block" id="ports"><div class="wrap">
+  <h2>MDA-8086 port addresses</h2>
+  <div class="tablebox"><table>
+    <tr><th>Device</th><th>Port</th><th>Notes</th></tr>
+    <tr><td>Dot matrix, red rows</td><td class="port">18H</td><td>0 lights a row; row bit 7 is the top</td></tr>
+    <tr><td>Dot matrix, green rows</td><td class="port">1AH</td><td>red and green together show yellow</td></tr>
+    <tr><td>Dot matrix, columns</td><td class="port">1CH</td><td>column bit 0 is the left side</td></tr>
+    <tr><td>8255 control (dot matrix)</td><td class="port">1EH</td><td><code>MOV AL,80H</code> / <code>OUT 1EH,AL</code></td></tr>
+    <tr><td>7-segment</td><td class="port">19H</td><td>0 lights a segment: 0 = C0H, 1 = F9H … 9 = 90H</td></tr>
+    <tr><td>LEDs PB0–PB3</td><td class="port">1BH</td><td></td></tr>
+    <tr><td>8255 control (7-segment, LEDs)</td><td class="port">1FH</td><td><code>MOV AL,80H</code> / <code>OUT 1FH,AL</code></td></tr>
+    <tr><td>LCD 16×2</td><td class="port">00H / 04H / 02H</td><td>command / data / status</td></tr>
+  </table></div>
+</div></section>
+
+<section class="block" id="faq"><div class="wrap">
+  <h2>Questions</h2>
+  <details><summary>Is it free?</summary><p>Yes. Download it from the GitHub releases page; the full source code is in the repository.</p></details>
+  <details><summary>Windows says "Windows protected your PC". Is it safe?</summary><p>The program is not signed with a paid certificate, so Windows does not know it yet. Right-click the zip, choose Properties, tick Unblock, then extract it. Or click More info, then Run anyway.</p></details>
+  <details><summary>Can I use it without the kit?</summary><p>Yes. The simulator runs your program and shows the dot matrix, 7-segment display, LEDs, LCD, registers and ports, so you can practise at home.</p></details>
+  <details><summary>Linux says I have no permission for the serial port.</summary><p>Run <code>sudo usermod -aG dialout $USER</code> once, then log out and in again (on Arch and Manjaro the group is <code>uucp</code>). The simulator needs no permission.</p></details>
+  <details><summary>It says "Kit not found".</summary><p>Check the kit's power, that SELECT MODE is on PC and that the cable is in. Press RESET on the kit while Kit Studio is waiting.</p></details>
+</div></section>
+</main>
+
+<footer><div class="wrap">
+  Made by <a href="https://github.com/arsizan">arsizan</a> for the Microprocessor and Assembly Language Sessional (CSE 3210) at Pabna University of Science and Technology.
+  The bundled JWasm assembler is under the Sybase Open Watcom Public License 1.0.
+</div></footer>
+</body>
+</html>
